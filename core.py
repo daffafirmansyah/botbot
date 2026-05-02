@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -54,17 +55,23 @@ def utc_now_iso() -> str:
 
 
 def make_logger(log_filename: str) -> Logger:
-    """Return a log(msg) function that prints + appends to SCRIPT_DIR/log_filename."""
+    """
+    Return a thread-safe log(msg) function that prints + appends to
+    SCRIPT_DIR/log_filename. Safe to call from multiple worker threads
+    (parallel withdraw firing).
+    """
     log_path = SCRIPT_DIR / log_filename
+    lock = threading.RLock()
 
     def log(line: str) -> None:
         stamped = f"[{utc_now_iso()}] {line}"
-        print(stamped, flush=True)
-        try:
-            with log_path.open("a", encoding="utf-8") as f:
-                f.write(stamped + "\n")
-        except OSError as e:
-            print(f"[warn] could not write log file {log_path}: {e}", file=sys.stderr)
+        with lock:
+            print(stamped, flush=True)
+            try:
+                with log_path.open("a", encoding="utf-8") as f:
+                    f.write(stamped + "\n")
+            except OSError as e:
+                print(f"[warn] could not write log file {log_path}: {e}", file=sys.stderr)
 
     return log
 

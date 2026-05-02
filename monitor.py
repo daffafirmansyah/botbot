@@ -25,7 +25,9 @@ from __future__ import annotations
 
 import signal
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
 from core import (
@@ -54,11 +56,20 @@ POLL_INTERVAL_SEC = 30               # how often we check the hot wallet balance
 TOPUP_THRESHOLD_LAMPORTS = 500_000   # 0.0005 SOL — ignore dust / tx fees
 # Per-account: stay under the site's 3 req / 60 s per-JWT rate limit.
 PER_ACCOUNT_SPACING_SEC = RATE_LIMIT_WINDOW_SEC // 2 + 5  # ~35s
-# Between two different accounts on a single top-up event: keep just
-# enough spacing to avoid sub-second bursts from the same IP.
+
+# Parallel firing: fire all eligible accounts simultaneously when a top-up
+# is detected, instead of sequential with INTER_ACCOUNT_SPACING_SEC between
+# them. Drastically increases hit rate when hot wallet drains fast.
+# Trade-off: makes the burst pattern from one IP more visible to WAF.
+PARALLEL_FIRE = True
+MAX_PARALLEL_WORKERS = 20            # cap concurrent in-flight POSTs
+
+# Sequential fallback (only used if PARALLEL_FIRE = False):
 INTER_ACCOUNT_SPACING_SEC = 5
-# Stop iterating if hot wallet drops below this mid-sequence — the remaining
-# accounts will almost certainly fail and we'd just burn rate-limit budget.
+
+# Stop firing if hot wallet drops below this — in parallel mode this is
+# checked once before kicking off the batch; in sequential mode it's
+# checked between accounts.
 HOT_WALLET_FLOOR_LAMPORTS = 200_000  # ~0.0002 SOL
 
 _stop = False
@@ -131,24 +142,70 @@ def _log_startup_status(accounts: list[dict], state: dict, log) -> None:
             log(f"[{acc['name']}] no prior success; will attempt on first top-up.")
 
 
-def _process_topup(
-    accounts: list[dict],
+def _record_attempt_outcome(
     state: dict,
-    current_hot: int,
-    prev_hot: int,
+    acc: dict,
+    exit_code: int,
     log,
 ) -> None:
-    """Iterate eligible accounts on a single top-up event."""
-    now = time.time()
-    eligible = _eligible_accounts(accounts, state, now)
-    delta = current_hot - prev_hot
-    log(
-        f"[topup] hot wallet {prev_hot/1e9:.9f} -> {current_hot/1e9:.9f} SOL "
-        f"(+{delta/1e9:.9f}); {len(eligible)} of {len(accounts)} account(s) eligible."
-    )
-    if not eligible:
-        return
+    """Update per-account state based on a finished attempt."""
+    entry = get_account_state(state, acc["name"])
+    if exit_code == EXIT_OK:
+        entry["last_success_at"] = utc_now_iso()
+        log(
+            f"[{acc['name']}] [ok] success; next attempt earliest in "
+            f"{_human_duration(DAILY_COOLDOWN_SEC)}."
+        )
+    elif exit_code == EXIT_COOLDOWN:
+        # Could be either 60 s rate limit or 24 h daily; assume daily to be safe.
+        entry["last_success_at"] = utc_now_iso()
+        log(f"[{acc['name']}] [cooldown] server refused; assuming 24h from now.")
+    else:
+        log(f"[{acc['name']}] [error] failed (exit={exit_code}); keep cooldown unchanged.")
 
+
+def _fire_one_threaded(acc: dict, state: dict, state_lock: threading.Lock, log) -> tuple[dict, int]:
+    """Worker thread body: mark attempt, fire, update state safely."""
+    with state_lock:
+        entry = get_account_state(state, acc["name"])
+        entry["last_attempt_ts"] = time.time()
+    log(f"[{acc['name']}] [fire] starting withdraw.")
+    exit_code, _parsed, _status = attempt_withdraw(acc, log, verify_onchain=False)
+    with state_lock:
+        _record_attempt_outcome(state, acc, exit_code, log)
+    return acc, exit_code
+
+
+def _process_topup_parallel(
+    eligible: list[dict],
+    state: dict,
+    log,
+) -> None:
+    log(f"[parallel] firing {len(eligible)} account(s) simultaneously "
+        f"(max workers={MAX_PARALLEL_WORKERS}).")
+    state_lock = threading.Lock()
+    workers = min(MAX_PARALLEL_WORKERS, len(eligible))
+
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="wd") as ex:
+        futures = [
+            ex.submit(_fire_one_threaded, acc, state, state_lock, log)
+            for acc in eligible
+        ]
+        for fut in as_completed(futures):
+            try:
+                fut.result()
+            except Exception as e:  # noqa: BLE001
+                log(f"[error] worker thread crashed: {e}")
+
+    save_state(state)
+    log(f"[parallel] all {len(eligible)} attempts complete.")
+
+
+def _process_topup_sequential(
+    eligible: list[dict],
+    state: dict,
+    log,
+) -> None:
     for i, acc in enumerate(eligible):
         if _stop:
             break
@@ -168,24 +225,44 @@ def _process_topup(
         log(f"[{acc['name']}] [fire] {i + 1}/{len(eligible)} starting withdraw.")
         entry["last_attempt_ts"] = time.time()
         exit_code, _parsed, _status = attempt_withdraw(acc, log, verify_onchain=False)
-
-        if exit_code == EXIT_OK:
-            entry["last_success_at"] = utc_now_iso()
-            log(
-                f"[{acc['name']}] [ok] success; next attempt earliest in "
-                f"{_human_duration(DAILY_COOLDOWN_SEC)}."
-            )
-        elif exit_code == EXIT_COOLDOWN:
-            # Could be either 60s rate limit or 24h daily; assume daily to be safe.
-            entry["last_success_at"] = utc_now_iso()
-            log(f"[{acc['name']}] [cooldown] server refused; assuming 24h from now.")
-        else:
-            log(f"[{acc['name']}] [error] failed (exit={exit_code}); keep cooldown unchanged.")
-
+        _record_attempt_outcome(state, acc, exit_code, log)
         save_state(state)
 
         if i < len(eligible) - 1 and not _stop:
             _sleep_with_stop(INTER_ACCOUNT_SPACING_SEC)
+
+
+def _process_topup(
+    accounts: list[dict],
+    state: dict,
+    current_hot: int,
+    prev_hot: int,
+    log,
+) -> None:
+    """Dispatch eligible accounts on a single top-up event."""
+    now = time.time()
+    eligible = _eligible_accounts(accounts, state, now)
+    delta = current_hot - prev_hot
+    log(
+        f"[topup] hot wallet {prev_hot/1e9:.9f} -> {current_hot/1e9:.9f} SOL "
+        f"(+{delta/1e9:.9f}); {len(eligible)} of {len(accounts)} account(s) eligible."
+    )
+    if not eligible:
+        return
+
+    # Pre-flight floor check (parallel mode can't check mid-burst).
+    pre_check = get_balance_lamports(HOT_WALLET)
+    if pre_check is not None and pre_check < HOT_WALLET_FLOOR_LAMPORTS:
+        log(
+            f"[topup] hot wallet already drained to {pre_check/1e9:.9f} SOL "
+            "before we could fire; aborting batch."
+        )
+        return
+
+    if PARALLEL_FIRE:
+        _process_topup_parallel(eligible, state, log)
+    else:
+        _process_topup_sequential(eligible, state, log)
 
 
 def main() -> int:
