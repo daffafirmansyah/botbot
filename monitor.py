@@ -81,6 +81,11 @@ INTER_ACCOUNT_SPACING_SEC = 5
 # checked between accounts.
 HOT_WALLET_FLOOR_LAMPORTS = 200_000  # ~0.0002 SOL
 
+# Log a short "alive" line every N seconds even when nothing interesting is
+# happening. Without this, a quiet hot wallet produces zero log output and
+# the bot looks dead to an outside observer. Set to 0 to disable.
+HEARTBEAT_INTERVAL_SEC = 600  # 10 minutes
+
 _stop = False
 
 
@@ -363,6 +368,8 @@ def main() -> int:
     last_balance = int(state.get("last_hot_balance_lamports", 0))
     # For log-throttling only.
     last_logged_balance = last_balance
+    # For the periodic "alive" heartbeat.
+    last_heartbeat_ts = time.time()
 
     while not _stop:
         current = get_balance_lamports(HOT_WALLET)
@@ -411,6 +418,19 @@ def main() -> int:
         # Persist state each loop.
         state["last_hot_balance_lamports"] = last_balance
         save_state(state)
+
+        # Periodic "alive" heartbeat so a quiet hot wallet doesn't look dead.
+        if (
+            HEARTBEAT_INTERVAL_SEC > 0
+            and now - last_heartbeat_ts >= HEARTBEAT_INTERVAL_SEC
+        ):
+            eligible_now = _eligible_accounts(accounts, state, now)
+            log(
+                f"[heartbeat] alive | hot_wallet={current/1e9:.9f} SOL | "
+                f"eligible={len(eligible_now)}/{len(accounts)} | "
+                f"next poll in {POLL_INTERVAL_SEC}s"
+            )
+            last_heartbeat_ts = now
 
         _sleep_with_stop(POLL_INTERVAL_SEC)
 
