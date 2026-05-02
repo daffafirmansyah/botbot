@@ -4,6 +4,7 @@ accounts.tsv
 accounts.csv
 withdraw.log
 monitor.log
+tasks.log
 __pycache__/
 *.pyc
 .venv/
