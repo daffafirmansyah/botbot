@@ -19,9 +19,11 @@ rate-limit budget.
 - It does **not** log in with Twitter / OAuth automatically. You must
   extract `bearer_token` and `cookie` from each logged-in browser
   session manually, even when running multiple accounts.
-- It does **not** retry-spam. Hitting the API more than 3 times in 60
-  seconds is rate-limited with `429 Too Many Requests` and bypasses
-  nothing.
+- It does **not** retry-spam blindly. The bot retries `429` (per-JWT
+  rate-limit) and `5xx` (server unavailable) responses with
+  Retry-After-aware delays + jitter, but **never** retries a 24h daily
+  cooldown — that's a server-enforced lock and retrying just burns
+  rate-limit budget.
 - It does **not** let you bypass the ~24-hour cooldown between
   successful withdraws on a given account.
 - It does **not** rotate IPs / proxies between accounts. Run on one
@@ -29,19 +31,37 @@ rate-limit budget.
 
 Anything beyond this scope is out of scope by design.
 
-## Why once per run
+## Retry policy
 
-From real traffic on this account:
-- `/api/withdraw` is rate-limited to **3 req / 60 s** (`ratelimit-policy: 3;w=60`).
-- Successful withdraws are spaced **~24 hours** apart (on-chain evidence).
-- When either limit is hit the server always returns the same body:
-  ```json
-  {"message": "Too many withdrawal requests, please try again later"}
-  ```
+From real traffic, the server differentiates errors with the **HTTP
+status code**, not just the message body:
 
-So the correct strategy is: one attempt, ideally at a time you know
-the daily cooldown has expired. If the server still refuses, stop and
-try again tomorrow — faster retries cannot succeed.
+| Response | Meaning | Bot behavior |
+| --- | --- | --- |
+| `429` + `Retry-After: <secs>` | Per-JWT rate-limit (3 req / 60 s) | **Auto-retry** after `Retry-After` + jitter, up to `MAX_RETRIES_RATE_LIMIT` (default 3). |
+| `429` + `Retry-After` very long | Server signaling a long lock | Treated as cooldown, no retry. |
+| `5xx` "Withdrawal is temporarily unavailable..." | Server maintenance / overload | **Auto-retry** with escalating backoff `30s → 60s → 120s` + jitter, up to `MAX_RETRIES_SERVER_ERROR` (default 3). |
+| `200` + `"Too many withdrawal requests..."` | 24-hour daily cooldown | **No retry** — server-enforced, retrying just burns rate-limit budget. State.json records `last_success_at` so the next run skips this account until 23h55m have passed. |
+| `2xx` + `success: true` | Withdrawal accepted | Done. On-chain delta confirmed (in `withdraw.py` mode). |
+
+So a single `attempt_withdraw()` call may make up to **7 HTTP requests
+in the worst case** (1 initial + 3 × 429 retries + 3 × 5xx retries),
+spread over ~6 minutes. In practice, success usually arrives within
+the first 2 attempts.
+
+All retry constants live at the top of `core.py`:
+
+```python
+MAX_RETRIES_RATE_LIMIT = 3       # 429 retries
+RETRY_429_FALLBACK_SEC = 30      # used when server omits Retry-After
+RETRY_429_MAX_WAIT_SEC = 300     # if Retry-After > this, treat as cooldown
+MAX_RETRIES_SERVER_ERROR = 3     # 5xx retries
+SERVER_ERROR_BACKOFF_SEC = (30, 60, 120)
+RETRY_JITTER_SEC = 5             # random extra wait so 50 workers don't sync
+```
+
+Set `MAX_RETRIES_*` to `0` to disable retries entirely (one attempt per
+account, exit on first failure).
 
 ## Setup
 

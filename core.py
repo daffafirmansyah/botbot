@@ -8,6 +8,7 @@ Keeps all HTTP, RPC and state-persistence logic in one place so
 from __future__ import annotations
 
 import json
+import random
 import sys
 import threading
 import time
@@ -48,6 +49,21 @@ DAILY_COOLDOWN_SEC = 23 * 3600 + 55 * 60  # 23h55m
 # (balanceSolTask from /api/user) is below this. Prevents burning rate-limit
 # budget on dust or on accounts already drained in the current cycle.
 MIN_WITHDRAW_SOL = 0.0005
+
+# ----- Retry policy for transient failures -----
+# 429 "Too many requests" with a short retry-after header is the per-JWT
+# rate-limit (3 req / 60s). Retrying after waiting is usually fruitful.
+# A 200-OK response containing "too many withdrawal" is the 24h daily
+# cooldown — NEVER retried (handled separately, not via these constants).
+MAX_RETRIES_RATE_LIMIT = 3       # how many times to retry a 429
+RETRY_429_FALLBACK_SEC = 30      # used when the server omits Retry-After
+RETRY_429_MAX_WAIT_SEC = 300     # if Retry-After > this, treat as cooldown
+# 5xx "server temporarily unavailable" — retry with escalating backoff.
+MAX_RETRIES_SERVER_ERROR = 3
+SERVER_ERROR_BACKOFF_SEC = (30, 60, 120)
+# Random jitter added to every retry delay so 50 parallel workers don't
+# thunder-herd the server in lockstep.
+RETRY_JITTER_SEC = 5
 
 Logger = Callable[[str], None]
 
@@ -532,54 +548,111 @@ def attempt_withdraw(
     headers = build_headers(cfg["bearer_token"], cfg["cookie"])
     body = {"amountSol": amount, "walletAddress": wallet}
 
-    try:
-        resp = requests.post(API_URL, headers=headers, json=body, timeout=30)
-    except requests.RequestException as e:
-        log(f"[{name}] [error] network error during POST: {e}")
-        return EXIT_NETWORK, None, 0
+    # ----- Retry loop -----
+    # 429 (per-JWT rate-limit) and 5xx (server unavailable) are transient and
+    # retryable. A 200-OK with "too many withdrawal" message is the 24h daily
+    # cooldown and is NOT retried.
+    rate_limit_retries_left = MAX_RETRIES_RATE_LIMIT
+    server_error_retries_left = MAX_RETRIES_SERVER_ERROR
+    attempt_num = 0
 
-    status = resp.status_code
-    try:
-        parsed = resp.json()
-    except ValueError:
-        parsed = None
+    while True:
+        attempt_num += 1
 
-    log(
-        f"[{name}] response status={status} "
-        f"body={parsed if parsed is not None else resp.text!r}"
-    )
+        try:
+            resp = requests.post(API_URL, headers=headers, json=body, timeout=30)
+        except requests.RequestException as e:
+            log(f"[{name}] [error] network error during POST: {e}")
+            return EXIT_NETWORK, None, 0
 
-    if status == 429:
-        retry_after = resp.headers.get("retry-after")
-        log(f"[{name}] [cooldown] 429 (retry-after={retry_after}s).")
-        return EXIT_COOLDOWN, parsed, status
+        status = resp.status_code
+        try:
+            parsed = resp.json()
+        except ValueError:
+            parsed = None
 
-    if is_cooldown_message(parsed):
-        log(f"[{name}] [cooldown] cooldown message detected.")
-        return EXIT_COOLDOWN, parsed, status
+        log(
+            f"[{name}] response status={status} "
+            f"body={parsed if parsed is not None else resp.text!r}"
+        )
 
-    if 200 <= status < 300 and isinstance(parsed, dict):
-        if parsed.get("success", True):
-            if verify_onchain:
-                log(f"[{name}] [ok] API success. verifying on-chain in 30s...")
-                time.sleep(30)
-                post = get_balance_lamports(wallet)
-                if post is not None and pre is not None:
-                    delta = (post - pre) / 1e9
-                    log(
-                        f"[{name}] post-balance: {post / 1e9:.9f} SOL | "
-                        f"delta: {delta:+.9f} SOL"
-                    )
-                    if delta > 0:
-                        log(f"[{name}] [ok] on-chain delta confirms withdraw landed.")
-                    else:
+        # ----- 429: per-JWT rate-limit, retry after Retry-After -----
+        if status == 429:
+            retry_after_raw = resp.headers.get("retry-after", "")
+            try:
+                retry_after = int(retry_after_raw) if retry_after_raw else RETRY_429_FALLBACK_SEC
+            except ValueError:
+                retry_after = RETRY_429_FALLBACK_SEC
+
+            # Long Retry-After (server explicitly says "wait hours") => not a
+            # short rate-limit, treat as cooldown and bail.
+            if retry_after > RETRY_429_MAX_WAIT_SEC:
+                log(
+                    f"[{name}] [cooldown] 429 retry-after={retry_after}s "
+                    f"exceeds {RETRY_429_MAX_WAIT_SEC}s; treating as cooldown."
+                )
+                return EXIT_COOLDOWN, parsed, status
+
+            if rate_limit_retries_left > 0:
+                wait = retry_after + random.uniform(0, RETRY_JITTER_SEC)
+                rate_limit_retries_left -= 1
+                log(
+                    f"[{name}] [retry] 429 rate-limit; sleeping {wait:.1f}s "
+                    f"then retry (attempt {attempt_num + 1}, "
+                    f"{rate_limit_retries_left} retries left)."
+                )
+                time.sleep(wait)
+                continue
+
+            log(f"[{name}] [cooldown] 429 retries exhausted; giving up.")
+            return EXIT_COOLDOWN, parsed, status
+
+        # ----- 200-ish + cooldown message: 24h daily cooldown, NO retry -----
+        if is_cooldown_message(parsed):
+            log(f"[{name}] [cooldown] daily cooldown message detected; not retrying.")
+            return EXIT_COOLDOWN, parsed, status
+
+        # ----- 5xx server unavailable: retry with escalating backoff -----
+        if 500 <= status < 600:
+            if server_error_retries_left > 0:
+                idx = MAX_RETRIES_SERVER_ERROR - server_error_retries_left
+                base = SERVER_ERROR_BACKOFF_SEC[min(idx, len(SERVER_ERROR_BACKOFF_SEC) - 1)]
+                wait = base + random.uniform(0, RETRY_JITTER_SEC)
+                server_error_retries_left -= 1
+                log(
+                    f"[{name}] [retry] {status} server error; sleeping "
+                    f"{wait:.1f}s then retry (attempt {attempt_num + 1}, "
+                    f"{server_error_retries_left} retries left)."
+                )
+                time.sleep(wait)
+                continue
+
+            log(f"[{name}] [error] {status} server error; retries exhausted.")
+            return EXIT_API_ERROR, parsed, status
+
+        # ----- 2xx success path -----
+        if 200 <= status < 300 and isinstance(parsed, dict):
+            if parsed.get("success", True):
+                if verify_onchain:
+                    log(f"[{name}] [ok] API success. verifying on-chain in 30s...")
+                    time.sleep(30)
+                    post = get_balance_lamports(wallet)
+                    if post is not None and pre is not None:
+                        delta = (post - pre) / 1e9
                         log(
-                            f"[{name}] [warn] API success but on-chain delta "
-                            "is zero. Withdraw may still be queued."
+                            f"[{name}] post-balance: {post / 1e9:.9f} SOL | "
+                            f"delta: {delta:+.9f} SOL"
                         )
-            else:
-                log(f"[{name}] [ok] API success (on-chain verify skipped).")
-            return EXIT_OK, parsed, status
+                        if delta > 0:
+                            log(f"[{name}] [ok] on-chain delta confirms withdraw landed.")
+                        else:
+                            log(
+                                f"[{name}] [warn] API success but on-chain delta "
+                                "is zero. Withdraw may still be queued."
+                            )
+                else:
+                    log(f"[{name}] [ok] API success (on-chain verify skipped).")
+                return EXIT_OK, parsed, status
 
-    log(f"[{name}] [error] unexpected response (treated as failure).")
-    return EXIT_API_ERROR, parsed, status
+        log(f"[{name}] [error] unexpected response (treated as failure).")
+        return EXIT_API_ERROR, parsed, status
