@@ -73,7 +73,10 @@ def make_logger(log_filename: str) -> Logger:
 # Config
 # ---------------------------------------------------------------------------
 
-def load_config() -> dict:
+REQUIRED_ACCOUNT_FIELDS = ("bearer_token", "cookie", "wallet_address", "amount_sol")
+
+
+def _read_config_file() -> dict:
     if not CONFIG_PATH.exists():
         print(
             f"[error] config.json not found at {CONFIG_PATH}.\n"
@@ -83,17 +86,86 @@ def load_config() -> dict:
         sys.exit(EXIT_CONFIG)
 
     try:
-        cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
     except json.JSONDecodeError as e:
         print(f"[error] config.json is not valid JSON: {e}", file=sys.stderr)
         sys.exit(EXIT_CONFIG)
 
-    required = ("bearer_token", "cookie", "wallet_address", "amount_sol")
-    missing = [k for k in required if not cfg.get(k)]
-    if missing:
-        print(f"[error] config.json missing fields: {', '.join(missing)}", file=sys.stderr)
+
+def load_accounts() -> list[dict]:
+    """
+    Return a list of account dicts.
+
+    Supports two schemas in config.json:
+
+    1) Multi-account (preferred):
+         {"accounts": [ {"name": "acc1", "bearer_token": ..., ...}, ... ]}
+
+    2) Legacy single-account (kept for backward compat):
+         {"bearer_token": ..., "cookie": ..., "wallet_address": ..., "amount_sol": ...}
+       This is wrapped as [{"name": "default", ...}].
+
+    Each account MUST have all of REQUIRED_ACCOUNT_FIELDS. The "name" field
+    is required in the multi-account schema (auto-assigned in legacy mode);
+    names must be unique and are used as keys in state.json.
+    """
+    data = _read_config_file()
+
+    # Legacy single-account.
+    if "accounts" not in data:
+        missing = [k for k in REQUIRED_ACCOUNT_FIELDS if not data.get(k)]
+        if missing:
+            print(
+                f"[error] config.json missing fields: {', '.join(missing)}",
+                file=sys.stderr,
+            )
+            sys.exit(EXIT_CONFIG)
+        acc = dict(data)
+        acc["name"] = acc.get("name") or "default"
+        return [acc]
+
+    # Multi-account.
+    raw_accounts = data.get("accounts")
+    if not isinstance(raw_accounts, list) or not raw_accounts:
+        print(
+            "[error] config.json 'accounts' must be a non-empty list.",
+            file=sys.stderr,
+        )
         sys.exit(EXIT_CONFIG)
-    return cfg
+
+    seen_names: set[str] = set()
+    normalized: list[dict] = []
+    for idx, acc in enumerate(raw_accounts):
+        if not isinstance(acc, dict):
+            print(f"[error] accounts[{idx}] is not an object.", file=sys.stderr)
+            sys.exit(EXIT_CONFIG)
+        name = acc.get("name") or f"acc{idx + 1}"
+        if name in seen_names:
+            print(
+                f"[error] duplicate account name {name!r} in config.json.",
+                file=sys.stderr,
+            )
+            sys.exit(EXIT_CONFIG)
+        seen_names.add(name)
+
+        missing = [k for k in REQUIRED_ACCOUNT_FIELDS if not acc.get(k)]
+        if missing:
+            print(
+                f"[error] account {name!r} missing fields: {', '.join(missing)}",
+                file=sys.stderr,
+            )
+            sys.exit(EXIT_CONFIG)
+
+        cleaned = dict(acc)
+        cleaned["name"] = name
+        normalized.append(cleaned)
+
+    return normalized
+
+
+def load_config() -> dict:
+    """Backward-compat wrapper: returns the first account. Deprecated."""
+    return load_accounts()[0]
 
 
 # ---------------------------------------------------------------------------
@@ -185,25 +257,73 @@ def iso_to_unix(iso: str) -> int:
 # ---------------------------------------------------------------------------
 # State persistence
 # ---------------------------------------------------------------------------
+#
+# Schema (v2, multi-account):
+#   {
+#     "last_hot_balance_lamports": <int>,
+#     "accounts": {
+#       "<account_name>": {
+#         "last_success_at": "<ISO UTC>" | null,
+#         "last_attempt_ts": <unix seconds>
+#       },
+#       ...
+#     }
+#   }
+
+DEFAULT_ACCOUNT_STATE: dict = {
+    "last_success_at": None,
+    "last_attempt_ts": 0,
+}
 
 DEFAULT_STATE: dict = {
     "last_hot_balance_lamports": 0,
-    "last_success_at": None,   # ISO UTC or None
-    "last_attempt_ts": 0,      # unix seconds
+    "accounts": {},
 }
+
+
+def _migrate_legacy_state(data: dict) -> dict:
+    """Detect v1 single-account state and migrate under the 'default' key."""
+    if "accounts" in data:
+        return data
+    migrated = {
+        "last_hot_balance_lamports": int(data.get("last_hot_balance_lamports", 0)),
+        "accounts": {
+            "default": {
+                "last_success_at": data.get("last_success_at"),
+                "last_attempt_ts": float(data.get("last_attempt_ts", 0)),
+            }
+        },
+    }
+    return migrated
 
 
 def load_state() -> dict:
     if not STATE_PATH.exists():
-        return dict(DEFAULT_STATE)
+        return {"last_hot_balance_lamports": 0, "accounts": {}}
     try:
         data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
-        # Fill in any missing keys with defaults.
-        merged = dict(DEFAULT_STATE)
-        merged.update({k: v for k, v in data.items() if k in DEFAULT_STATE})
-        return merged
+        data = _migrate_legacy_state(data)
+        if "last_hot_balance_lamports" not in data:
+            data["last_hot_balance_lamports"] = 0
+        if "accounts" not in data or not isinstance(data["accounts"], dict):
+            data["accounts"] = {}
+        return data
     except (OSError, json.JSONDecodeError):
-        return dict(DEFAULT_STATE)
+        return {"last_hot_balance_lamports": 0, "accounts": {}}
+
+
+def get_account_state(state: dict, name: str) -> dict:
+    """Return (and lazily create) the per-account state entry."""
+    accounts = state.setdefault("accounts", {})
+    entry = accounts.get(name)
+    if entry is None:
+        entry = dict(DEFAULT_ACCOUNT_STATE)
+        accounts[name] = entry
+    else:
+        # Fill in any missing defaults (robust to older files).
+        for k, v in DEFAULT_ACCOUNT_STATE.items():
+            entry.setdefault(k, v)
+    return entry
 
 
 def save_state(state: dict) -> None:
@@ -253,21 +373,33 @@ def is_cooldown_message(parsed: dict | None) -> bool:
 # Core withdraw attempt
 # ---------------------------------------------------------------------------
 
-def attempt_withdraw(cfg: dict, log: Logger) -> tuple[int, dict | None, int]:
+def attempt_withdraw(
+    cfg: dict,
+    log: Logger,
+    verify_onchain: bool = True,
+) -> tuple[int, dict | None, int]:
     """
-    Send exactly one POST to /api/withdraw.
+    Send exactly one POST to /api/withdraw for a single account config.
+
+    Args:
+        cfg: account dict with bearer_token, cookie, wallet_address, amount_sol.
+             Optional "name" field is used purely for log context.
+        log: logger callable.
+        verify_onchain: if True (default), sleep 30s after a 2xx success and
+             confirm the balance delta on-chain. Set False when iterating
+             multiple accounts on a single top-up event to stay snappy.
 
     Returns (exit_code, parsed_body_or_none, http_status_or_0).
-
-    Exit codes follow the same convention as withdraw.py:
-      EXIT_OK, EXIT_COOLDOWN, EXIT_API_ERROR, EXIT_NETWORK.
     """
     wallet = cfg["wallet_address"]
     amount = float(cfg["amount_sol"])
+    name = cfg.get("name", "?")
 
-    pre = get_balance_lamports(wallet)
-    if pre is not None:
-        log(f"pre-balance on-chain (user): {pre / 1e9:.9f} SOL")
+    pre: int | None = None
+    if verify_onchain:
+        pre = get_balance_lamports(wallet)
+        if pre is not None:
+            log(f"[{name}] pre-balance on-chain: {pre / 1e9:.9f} SOL")
 
     headers = build_headers(cfg["bearer_token"], cfg["cookie"])
     body = {"amountSol": amount, "walletAddress": wallet}
@@ -275,7 +407,7 @@ def attempt_withdraw(cfg: dict, log: Logger) -> tuple[int, dict | None, int]:
     try:
         resp = requests.post(API_URL, headers=headers, json=body, timeout=30)
     except requests.RequestException as e:
-        log(f"[error] network error during POST: {e}")
+        log(f"[{name}] [error] network error during POST: {e}")
         return EXIT_NETWORK, None, 0
 
     status = resp.status_code
@@ -284,35 +416,42 @@ def attempt_withdraw(cfg: dict, log: Logger) -> tuple[int, dict | None, int]:
     except ValueError:
         parsed = None
 
-    log(f"response status={status} body={parsed if parsed is not None else resp.text!r}")
+    log(
+        f"[{name}] response status={status} "
+        f"body={parsed if parsed is not None else resp.text!r}"
+    )
 
     if status == 429:
         retry_after = resp.headers.get("retry-after")
-        log(f"[cooldown] 429 (retry-after={retry_after}s).")
+        log(f"[{name}] [cooldown] 429 (retry-after={retry_after}s).")
         return EXIT_COOLDOWN, parsed, status
 
     if is_cooldown_message(parsed):
-        log("[cooldown] cooldown message detected.")
+        log(f"[{name}] [cooldown] cooldown message detected.")
         return EXIT_COOLDOWN, parsed, status
 
     if 200 <= status < 300 and isinstance(parsed, dict):
         if parsed.get("success", True):
-            log("[ok] API returned success. verifying on-chain in 30s...")
-            time.sleep(30)
-            post = get_balance_lamports(wallet)
-            if post is not None and pre is not None:
-                delta = (post - pre) / 1e9
-                log(
-                    f"post-balance: {post / 1e9:.9f} SOL | delta: {delta:+.9f} SOL"
-                )
-                if delta > 0:
-                    log("[ok] on-chain delta confirms withdraw landed.")
-                else:
+            if verify_onchain:
+                log(f"[{name}] [ok] API success. verifying on-chain in 30s...")
+                time.sleep(30)
+                post = get_balance_lamports(wallet)
+                if post is not None and pre is not None:
+                    delta = (post - pre) / 1e9
                     log(
-                        "[warn] API success but on-chain delta is zero. "
-                        "Withdraw may still be queued; re-check later."
+                        f"[{name}] post-balance: {post / 1e9:.9f} SOL | "
+                        f"delta: {delta:+.9f} SOL"
                     )
+                    if delta > 0:
+                        log(f"[{name}] [ok] on-chain delta confirms withdraw landed.")
+                    else:
+                        log(
+                            f"[{name}] [warn] API success but on-chain delta "
+                            "is zero. Withdraw may still be queued."
+                        )
+            else:
+                log(f"[{name}] [ok] API success (on-chain verify skipped).")
             return EXIT_OK, parsed, status
 
-    log("[error] unexpected response (treated as failure).")
+    log(f"[{name}] [error] unexpected response (treated as failure).")
     return EXIT_API_ERROR, parsed, status

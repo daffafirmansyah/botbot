@@ -1,16 +1,18 @@
 """
-Claimyshare auto-withdraw — watch-loop mode.
+Claimyshare auto-withdraw — watch-loop mode (multi-account).
 
 Polls the site's hot wallet (8MrX...) on Solana mainnet. When the
-balance goes up by more than a configurable threshold (i.e. the admin
-topped it up so payouts can flow), this script fires ONE withdraw
-request for our account — but only if:
+balance goes up by more than TOPUP_THRESHOLD_LAMPORTS (i.e. the admin
+topped it up so payouts can flow), this script iterates over every
+account in config.json and fires ONE withdraw per eligible account,
+spaced INTER_ACCOUNT_SPACING_SEC apart.
 
-  * we are not inside the observed ~24h daily cooldown, and
-  * at least RATE_LIMIT_WINDOW_SEC has passed since the previous
-    attempt (to stay under the 3 req / 60s site rate limit).
+Eligibility per account:
+  * not inside its observed ~24h daily cooldown, and
+  * at least PER_ACCOUNT_SPACING_SEC has passed since that account's
+    previous attempt (per-JWT rate limit is 3 req / 60 s).
 
-State (last known balance, last success time, last attempt time) is
+State (last hot balance + per-account last success / attempt times) is
 persisted to state.json so restarts don't re-fire attempts.
 
 Run:
@@ -34,9 +36,10 @@ from core import (
     RATE_LIMIT_WINDOW_SEC,
     attempt_withdraw,
     bootstrap_last_success_iso,
+    get_account_state,
     get_balance_lamports,
     iso_to_unix,
-    load_config,
+    load_accounts,
     load_state,
     make_logger,
     save_state,
@@ -47,10 +50,16 @@ from core import (
 # Tunables
 # ---------------------------------------------------------------------------
 
-POLL_INTERVAL_SEC = 30          # how often we check the hot wallet balance
+POLL_INTERVAL_SEC = 30               # how often we check the hot wallet balance
 TOPUP_THRESHOLD_LAMPORTS = 500_000   # 0.0005 SOL — ignore dust / tx fees
-ATTEMPT_SPACING_SEC = RATE_LIMIT_WINDOW_SEC // 2 + 5  # ~35s between our POSTs
-
+# Per-account: stay under the site's 3 req / 60 s per-JWT rate limit.
+PER_ACCOUNT_SPACING_SEC = RATE_LIMIT_WINDOW_SEC // 2 + 5  # ~35s
+# Between two different accounts on a single top-up event: avoid bursts
+# that look like a coordinated bot to the CDN / WAF.
+INTER_ACCOUNT_SPACING_SEC = 15
+# Stop iterating if hot wallet drops below this mid-sequence — the remaining
+# accounts will almost certainly fail and we'd just burn rate-limit budget.
+HOT_WALLET_FLOOR_LAMPORTS = 200_000  # ~0.0002 SOL
 
 _stop = False
 
@@ -79,37 +88,122 @@ def _seconds_until_cooldown_ends(last_success_iso: Optional[str], now: float) ->
     return max(0.0, remaining)
 
 
+def _eligible_accounts(accounts: list[dict], state: dict, now: float) -> list[dict]:
+    """Return accounts that are neither in daily cooldown nor in their own rate-limit window."""
+    eligible: list[dict] = []
+    for acc in accounts:
+        entry = get_account_state(state, acc["name"])
+        if _seconds_until_cooldown_ends(entry["last_success_at"], now) > 0:
+            continue
+        if now - float(entry["last_attempt_ts"]) < PER_ACCOUNT_SPACING_SEC:
+            continue
+        eligible.append(acc)
+    return eligible
+
+
+def _bootstrap_accounts(accounts: list[dict], state: dict, log) -> None:
+    """On first-ever run, fill last_success_at for each account from chain."""
+    for acc in accounts:
+        entry = get_account_state(state, acc["name"])
+        if entry["last_success_at"] is not None:
+            continue
+        log(f"[{acc['name']}] [bootstrap] scanning chain for last hot-wallet payout...")
+        discovered = bootstrap_last_success_iso(acc["wallet_address"], log)
+        if discovered:
+            entry["last_success_at"] = discovered
+    save_state(state)
+
+
+def _log_startup_status(accounts: list[dict], state: dict, log) -> None:
+    now = time.time()
+    for acc in accounts:
+        entry = get_account_state(state, acc["name"])
+        lsa = entry["last_success_at"]
+        if lsa:
+            cd = _seconds_until_cooldown_ends(lsa, now)
+            status = (
+                f"ready ({_human_duration(-cd)} past cooldown)"
+                if cd <= 0
+                else f"cooldown ends in {_human_duration(cd)}"
+            )
+            log(f"[{acc['name']}] last success {lsa}, {status}")
+        else:
+            log(f"[{acc['name']}] no prior success; will attempt on first top-up.")
+
+
+def _process_topup(
+    accounts: list[dict],
+    state: dict,
+    current_hot: int,
+    prev_hot: int,
+    log,
+) -> None:
+    """Iterate eligible accounts on a single top-up event."""
+    now = time.time()
+    eligible = _eligible_accounts(accounts, state, now)
+    delta = current_hot - prev_hot
+    log(
+        f"[topup] hot wallet {prev_hot/1e9:.9f} -> {current_hot/1e9:.9f} SOL "
+        f"(+{delta/1e9:.9f}); {len(eligible)} of {len(accounts)} account(s) eligible."
+    )
+    if not eligible:
+        return
+
+    for i, acc in enumerate(eligible):
+        if _stop:
+            break
+
+        # Mid-sequence hot-wallet floor guard.
+        if i > 0:
+            current_hot_now = get_balance_lamports(HOT_WALLET)
+            if current_hot_now is not None and current_hot_now < HOT_WALLET_FLOOR_LAMPORTS:
+                log(
+                    f"[topup] hot wallet drained to "
+                    f"{current_hot_now/1e9:.9f} SOL; aborting remaining "
+                    f"{len(eligible) - i} account(s)."
+                )
+                break
+
+        entry = get_account_state(state, acc["name"])
+        log(f"[{acc['name']}] [fire] {i + 1}/{len(eligible)} starting withdraw.")
+        entry["last_attempt_ts"] = time.time()
+        exit_code, _parsed, _status = attempt_withdraw(acc, log, verify_onchain=False)
+
+        if exit_code == EXIT_OK:
+            entry["last_success_at"] = utc_now_iso()
+            log(
+                f"[{acc['name']}] [ok] success; next attempt earliest in "
+                f"{_human_duration(DAILY_COOLDOWN_SEC)}."
+            )
+        elif exit_code == EXIT_COOLDOWN:
+            # Could be either 60s rate limit or 24h daily; assume daily to be safe.
+            entry["last_success_at"] = utc_now_iso()
+            log(f"[{acc['name']}] [cooldown] server refused; assuming 24h from now.")
+        else:
+            log(f"[{acc['name']}] [error] failed (exit={exit_code}); keep cooldown unchanged.")
+
+        save_state(state)
+
+        if i < len(eligible) - 1 and not _stop:
+            _sleep_with_stop(INTER_ACCOUNT_SPACING_SEC)
+
+
 def main() -> int:
-    cfg = load_config()
+    accounts = load_accounts()
     log = make_logger("monitor.log")
     signal.signal(signal.SIGINT, _handle_sigint)
 
-    state = load_state()
-
-    # First-run bootstrap: discover the real last-success time from chain,
-    # so we don't fire inside an existing cooldown.
-    if state.get("last_success_at") is None:
-        log("[bootstrap] no prior success recorded; scanning on-chain history...")
-        discovered = bootstrap_last_success_iso(cfg["wallet_address"], log)
-        if discovered:
-            state["last_success_at"] = discovered
-            save_state(state)
-
     log(
-        f"monitor started | poll={POLL_INTERVAL_SEC}s "
-        f"topup>={TOPUP_THRESHOLD_LAMPORTS/1e9:.6f} SOL "
-        f"hot_wallet={HOT_WALLET}"
+        f"monitor started | accounts={len(accounts)} "
+        f"poll={POLL_INTERVAL_SEC}s topup>={TOPUP_THRESHOLD_LAMPORTS/1e9:.6f} SOL"
     )
-    if state["last_success_at"]:
-        cd = _seconds_until_cooldown_ends(state["last_success_at"], time.time())
-        log(f"last success at {state['last_success_at']}; daily cooldown ends in {_human_duration(cd)}")
-    else:
-        log("no recorded last success; will attempt on first detected top-up.")
+
+    state = load_state()
+    _bootstrap_accounts(accounts, state, log)
+    _log_startup_status(accounts, state, log)
 
     last_balance = int(state.get("last_hot_balance_lamports", 0))
-    last_success_iso: Optional[str] = state.get("last_success_at")
-    last_attempt_ts: float = float(state.get("last_attempt_ts", 0))
-    # Prevents noisy "balance changed" log spam when nothing interesting happens.
+    # For log-throttling only.
     last_logged_balance = last_balance
 
     while not _stop:
@@ -121,7 +215,7 @@ def main() -> int:
             _sleep_with_stop(POLL_INTERVAL_SEC)
             continue
 
-        # Prime last_balance on very first successful read.
+        # Prime on the very first successful read.
         if last_balance == 0:
             last_balance = current
             last_logged_balance = current
@@ -132,66 +226,32 @@ def main() -> int:
         delta = current - last_balance
         topup_detected = delta >= TOPUP_THRESHOLD_LAMPORTS
 
-        cooldown_remaining = _seconds_until_cooldown_ends(last_success_iso, now)
-        in_daily_cooldown = cooldown_remaining > 0
-        since_last_attempt = now - last_attempt_ts
-        in_rate_limit = since_last_attempt < ATTEMPT_SPACING_SEC
-
-        if topup_detected and not in_daily_cooldown and not in_rate_limit:
-            log(
-                f"[topup] {last_balance/1e9:.9f} -> {current/1e9:.9f} SOL "
-                f"(+{delta/1e9:.9f}). attempting withdraw."
-            )
-            last_attempt_ts = now
-            exit_code, parsed, status = attempt_withdraw(cfg, log)
-
-            if exit_code == EXIT_OK:
-                last_success_iso = utc_now_iso()
-                log(
-                    f"[ok] withdraw succeeded at {last_success_iso}; "
-                    f"next attempt earliest in {_human_duration(DAILY_COOLDOWN_SEC)}."
-                )
-            elif exit_code == EXIT_COOLDOWN:
-                # Server refused with cooldown message. We don't know if it's
-                # the 60s rate limit or the 24h daily cooldown, so conservatively
-                # treat as daily cooldown.
-                last_success_iso = utc_now_iso()
-                log("[cooldown] server refused; assuming 24h cooldown from now.")
+        if topup_detected:
+            eligible_count = len(_eligible_accounts(accounts, state, now))
+            if eligible_count > 0:
+                _process_topup(accounts, state, current, last_balance, log)
             else:
-                log(f"[error] attempt failed (exit={exit_code}). will retry on next top-up.")
-                # Keep last_success_iso unchanged so we don't lock ourselves out.
-
-            # Always bump the last-known balance to "now" so we only react to
-            # the NEXT top-up, not this one again.
+                # Top-up but everyone is on cooldown — log once, then move on.
+                log(
+                    f"[topup-skip] {last_balance/1e9:.9f} -> {current/1e9:.9f} SOL "
+                    f"(+{delta/1e9:.9f}); all accounts in cooldown."
+                )
+            # Always advance the baseline so we don't re-fire on the same refill.
             last_balance = current
             last_logged_balance = current
 
         else:
-            # Small logging: only print if something interesting happened.
+            # Non-topup: only occasionally log balance drift.
             if abs(current - last_logged_balance) >= TOPUP_THRESHOLD_LAMPORTS:
-                reason = []
-                if not topup_detected:
-                    reason.append("no topup")
-                if in_daily_cooldown:
-                    reason.append(f"daily cd {_human_duration(cooldown_remaining)}")
-                if in_rate_limit:
-                    reason.append(
-                        f"rate cd {_human_duration(ATTEMPT_SPACING_SEC - since_last_attempt)}"
-                    )
                 log(
-                    f"balance {last_logged_balance/1e9:.9f} -> {current/1e9:.9f} SOL; "
-                    f"skipping ({', '.join(reason) or 'no action'})."
+                    f"balance {last_logged_balance/1e9:.9f} -> "
+                    f"{current/1e9:.9f} SOL (no topup)."
                 )
                 last_logged_balance = current
-
-            # Update tracked balance even on non-attempt so we don't re-fire on
-            # stale deltas once cooldowns expire.
             last_balance = current
 
-        # Persist state every loop iteration.
+        # Persist state each loop.
         state["last_hot_balance_lamports"] = last_balance
-        state["last_success_at"] = last_success_iso
-        state["last_attempt_ts"] = last_attempt_ts
         save_state(state)
 
         _sleep_with_stop(POLL_INTERVAL_SEC)
