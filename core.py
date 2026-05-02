@@ -8,6 +8,7 @@ Keeps all HTTP, RPC and state-persistence logic in one place so
 from __future__ import annotations
 
 import json
+import math
 import random
 import sys
 import threading
@@ -51,19 +52,27 @@ DAILY_COOLDOWN_SEC = 23 * 3600 + 55 * 60  # 23h55m
 MIN_WITHDRAW_SOL = 0.0005
 
 # ----- Retry policy for transient failures -----
-# 429 "Too many requests" with a short retry-after header is the per-JWT
-# rate-limit (3 req / 60s). Retrying after waiting is usually fruitful.
-# A 200-OK response containing "too many withdrawal" is the 24h daily
-# cooldown — NEVER retried (handled separately, not via these constants).
-MAX_RETRIES_RATE_LIMIT = 3       # how many times to retry a 429
-RETRY_429_FALLBACK_SEC = 30      # used when the server omits Retry-After
-RETRY_429_MAX_WAIT_SEC = 300     # if Retry-After > this, treat as cooldown
-# 5xx "server temporarily unavailable" — retry with escalating backoff.
-MAX_RETRIES_SERVER_ERROR = 3
-SERVER_ERROR_BACKOFF_SEC = (30, 60, 120)
-# Random jitter added to every retry delay so 50 parallel workers don't
-# thunder-herd the server in lockstep.
-RETRY_JITTER_SEC = 5
+# Snipe-mode defaults: retry 429 and 5xx INDEFINITELY. The bot keeps
+# trying until either:
+#   (a) the server returns 2xx success, or
+#   (b) the server returns a 200-OK with "too many withdrawal" message,
+#       which is the 24h daily cooldown — server-enforced, no retry.
+#
+# 429 = per-JWT rate-limit (3 req / 60s) — server tells us when via the
+#       Retry-After header. We honor it + jitter, then retry.
+# 5xx = server temporarily unavailable. We back off exponentially up to
+#       a cap so we don't hammer the server during a real outage.
+#
+# Set MAX_RETRIES_* to a finite int if you want bounded retries instead.
+MAX_RETRIES_RATE_LIMIT = math.inf      # infinite retries on 429
+MAX_RETRIES_SERVER_ERROR = math.inf    # infinite retries on 5xx
+RETRY_429_FALLBACK_SEC = 30            # used when server omits Retry-After
+RETRY_429_MAX_WAIT_SEC = 3600          # if Retry-After > 1h, server is signaling
+                                       # a long lock, treat as cooldown to free
+                                       # rate-limit budget for other accounts
+SERVER_ERROR_BACKOFF_SEC = (30, 60, 120, 300)  # caps at 5 min between retries
+RETRY_JITTER_SEC = 5                   # random jitter so parallel workers don't
+                                       # sync up
 
 Logger = Callable[[str], None]
 
@@ -596,10 +605,15 @@ def attempt_withdraw(
             if rate_limit_retries_left > 0:
                 wait = retry_after + random.uniform(0, RETRY_JITTER_SEC)
                 rate_limit_retries_left -= 1
+                left_str = (
+                    "unlimited"
+                    if rate_limit_retries_left == math.inf
+                    else f"{int(rate_limit_retries_left)}"
+                )
                 log(
                     f"[{name}] [retry] 429 rate-limit; sleeping {wait:.1f}s "
                     f"then retry (attempt {attempt_num + 1}, "
-                    f"{rate_limit_retries_left} retries left)."
+                    f"{left_str} retries left)."
                 )
                 time.sleep(wait)
                 continue
@@ -615,14 +629,21 @@ def attempt_withdraw(
         # ----- 5xx server unavailable: retry with escalating backoff -----
         if 500 <= status < 600:
             if server_error_retries_left > 0:
-                idx = MAX_RETRIES_SERVER_ERROR - server_error_retries_left
-                base = SERVER_ERROR_BACKOFF_SEC[min(idx, len(SERVER_ERROR_BACKOFF_SEC) - 1)]
+                # `attempt_num - 1` is how many 5xx-driven retries we've already
+                # done (clamped to backoff array length so it plateaus).
+                idx = min(attempt_num - 1, len(SERVER_ERROR_BACKOFF_SEC) - 1)
+                base = SERVER_ERROR_BACKOFF_SEC[idx]
                 wait = base + random.uniform(0, RETRY_JITTER_SEC)
                 server_error_retries_left -= 1
+                left_str = (
+                    "unlimited"
+                    if server_error_retries_left == math.inf
+                    else f"{int(server_error_retries_left)}"
+                )
                 log(
                     f"[{name}] [retry] {status} server error; sleeping "
                     f"{wait:.1f}s then retry (attempt {attempt_num + 1}, "
-                    f"{server_error_retries_left} retries left)."
+                    f"{left_str} retries left)."
                 )
                 time.sleep(wait)
                 continue

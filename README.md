@@ -31,37 +31,66 @@ rate-limit budget.
 
 Anything beyond this scope is out of scope by design.
 
-## Retry policy
+## Retry policy (snipe mode)
 
-From real traffic, the server differentiates errors with the **HTTP
-status code**, not just the message body:
+The bot is configured to **snipe withdraws until they succeed**. For
+transient failures, it retries indefinitely (with respectful backoff)
+until either (a) the account succeeds, or (b) the server signals the
+24-hour daily cooldown — which no amount of retrying can bypass.
 
 | Response | Meaning | Bot behavior |
 | --- | --- | --- |
-| `429` + `Retry-After: <secs>` | Per-JWT rate-limit (3 req / 60 s) | **Auto-retry** after `Retry-After` + jitter, up to `MAX_RETRIES_RATE_LIMIT` (default 3). |
-| `429` + `Retry-After` very long | Server signaling a long lock | Treated as cooldown, no retry. |
-| `5xx` "Withdrawal is temporarily unavailable..." | Server maintenance / overload | **Auto-retry** with escalating backoff `30s → 60s → 120s` + jitter, up to `MAX_RETRIES_SERVER_ERROR` (default 3). |
-| `200` + `"Too many withdrawal requests..."` | 24-hour daily cooldown | **No retry** — server-enforced, retrying just burns rate-limit budget. State.json records `last_success_at` so the next run skips this account until 23h55m have passed. |
+| `429` + `Retry-After: <secs>` | Per-JWT rate-limit (3 req / 60 s) | **Auto-retry forever** after `Retry-After` + jitter. |
+| `429` + `Retry-After > 1 hour` | Server signaling a long lock | Treated as cooldown — retrying would just burn rate-limit budget that other accounts could use. |
+| `5xx` "Withdrawal is temporarily unavailable..." | Server maintenance / overload | **Auto-retry forever** with escalating backoff `30s → 60s → 120s → 300s → 300s → ...` + jitter (caps at 5 min between retries). |
+| `200` + `"Too many withdrawal requests..."` | **24-hour daily cooldown** | **No retry** — server-enforced lock. The account already withdrew today; retrying just wastes rate-limit. State.json records `last_success_at` so other runs skip this account until 23h55m have passed. |
 | `2xx` + `success: true` | Withdrawal accepted | Done. On-chain delta confirmed (in `withdraw.py` mode). |
 
-So a single `attempt_withdraw()` call may make up to **7 HTTP requests
-in the worst case** (1 initial + 3 × 429 retries + 3 × 5xx retries),
-spread over ~6 minutes. In practice, success usually arrives within
-the first 2 attempts.
+Why no retry on the 24h cooldown? Because the server **rejects the
+withdraw** until the 24h timer expires. Retrying just trips the
+3 req / 60 s rate-limit, costing budget that could be spent sniping
+*other* accounts that ARE eligible.
 
-All retry constants live at the top of `core.py`:
+### Tunables (`core.py`)
 
 ```python
-MAX_RETRIES_RATE_LIMIT = 3       # 429 retries
-RETRY_429_FALLBACK_SEC = 30      # used when server omits Retry-After
-RETRY_429_MAX_WAIT_SEC = 300     # if Retry-After > this, treat as cooldown
-MAX_RETRIES_SERVER_ERROR = 3     # 5xx retries
-SERVER_ERROR_BACKOFF_SEC = (30, 60, 120)
-RETRY_JITTER_SEC = 5             # random extra wait so 50 workers don't sync
+MAX_RETRIES_RATE_LIMIT = math.inf       # infinite retries on 429
+MAX_RETRIES_SERVER_ERROR = math.inf     # infinite retries on 5xx
+RETRY_429_FALLBACK_SEC = 30             # if Retry-After header is missing
+RETRY_429_MAX_WAIT_SEC = 3600           # if Retry-After > 1h => treat as cooldown
+SERVER_ERROR_BACKOFF_SEC = (30, 60, 120, 300)  # plateaus at 5 min
+RETRY_JITTER_SEC = 5                    # random jitter, anti-thunder-herd
 ```
 
-Set `MAX_RETRIES_*` to `0` to disable retries entirely (one attempt per
-account, exit on first failure).
+If you'd rather have bounded retries (e.g. for debugging), set
+`MAX_RETRIES_RATE_LIMIT = 3` and `MAX_RETRIES_SERVER_ERROR = 3`.
+
+### What you'll see in the log
+
+```
+[acc1] response status=429 body={'message': 'Too many withdrawal requests...'}
+[acc1] [retry] 429 rate-limit; sleeping 32.4s then retry (attempt 2, unlimited retries left).
+[acc1] response status=429 body={'message': 'Too many withdrawal requests...'}
+[acc1] [retry] 429 rate-limit; sleeping 31.7s then retry (attempt 3, unlimited retries left).
+[acc1] response status=200 body={'success': True, 'tx': '5JfP...'}
+[acc1] [ok] API success.
+```
+
+Or for server outage:
+
+```
+[acc2] response status=500 body={'message': 'Withdrawal is temporarily unavailable...'}
+[acc2] [retry] 500 server error; sleeping 33.1s then retry (attempt 2, unlimited retries left).
+[acc2] response status=500 body={'message': 'Withdrawal is temporarily unavailable...'}
+[acc2] [retry] 500 server error; sleeping 64.8s then retry (attempt 3, unlimited retries left).
+[acc2] response status=500 body={'message': 'Withdrawal is temporarily unavailable...'}
+[acc2] [retry] 500 server error; sleeping 122.5s then retry (attempt 4, unlimited retries left).
+[acc2] response status=500 body={'message': 'Withdrawal is temporarily unavailable...'}
+[acc2] [retry] 500 server error; sleeping 303.2s then retry (attempt 5, unlimited retries left).
+... (sleeps 5 min between every subsequent attempt) ...
+[acc2] response status=200 body={'success': True, 'tx': '8KqR...'}
+[acc2] [ok] API success.
+```
 
 ## Setup
 
