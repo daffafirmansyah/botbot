@@ -8,7 +8,7 @@ Two modes:
 
 | Mode | Entry point | What it does | When to use |
 | --- | --- | --- | --- |
-| **One-shot** | `python withdraw.py` | Iterates every account in `config.json`, fires one POST per account (15 s spacing), exits. | Run manually, or schedule once per day. |
+| **One-shot** | `python withdraw.py` | Iterates every account in `config.json`, fires one POST per account (5 s spacing), exits. | Run manually, or schedule once per day. |
 | **Monitor** | `python monitor.py` | Watches the site's hot wallet (`8MrX...`) on-chain. The moment it's topped up, fires one withdraw per eligible account. Keeps running. | "Be first after the admin refill" strategy. |
 
 Pick **one** mode — running both concurrently wastes per-account
@@ -97,9 +97,9 @@ separately. Twitter / OAuth auto-login is **not** supported by design.
 python withdraw.py
 ```
 
-Iterates every account in `config.json` once, with a 15 s gap between
-accounts (to avoid sub-second bursts that look like a bot). Each
-account gets exactly one POST.
+Iterates every account in `config.json` once, with a 5 s gap between
+accounts (just enough to avoid sub-second bursts). Each account gets
+exactly one POST.
 
 Expected outputs (per account):
 
@@ -135,7 +135,7 @@ What happens on start:
 3. When balance jumps by **≥ 0.0005 SOL**, it builds the list of
    eligible accounts (not in their own 24 h cooldown, not within the
    per-account rate-limit window) and fires one POST per eligible
-   account, spaced **15 s** apart.
+   account, spaced **5 s** apart.
 4. If hot wallet drains below ~0.0002 SOL mid-sequence, the remaining
    accounts are skipped (they would fail anyway).
 5. After each success, that account is locked out for ~23 h 55 m.
@@ -166,7 +166,7 @@ Tunables (top of `monitor.py`):
 | `POLL_INTERVAL_SEC` | 30 | How often to hit Solana RPC for the hot wallet balance. |
 | `TOPUP_THRESHOLD_LAMPORTS` | 500,000 (0.0005 SOL) | Ignore dust / tx-fee noise; only react to real refills. |
 | `PER_ACCOUNT_SPACING_SEC` | ~35 | Min gap between two attempts on the **same** account (3/60 s rate limit). |
-| `INTER_ACCOUNT_SPACING_SEC` | 15 | Gap between two **different** accounts firing on the same top-up. |
+| `INTER_ACCOUNT_SPACING_SEC` | 5 | Gap between two **different** accounts firing on the same top-up. |
 | `HOT_WALLET_FLOOR_LAMPORTS` | 200,000 (0.0002 SOL) | If hot wallet drops below this mid-sequence, skip remaining accounts. |
 
 ### Keep it running

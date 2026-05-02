@@ -54,9 +54,9 @@ POLL_INTERVAL_SEC = 30               # how often we check the hot wallet balance
 TOPUP_THRESHOLD_LAMPORTS = 500_000   # 0.0005 SOL — ignore dust / tx fees
 # Per-account: stay under the site's 3 req / 60 s per-JWT rate limit.
 PER_ACCOUNT_SPACING_SEC = RATE_LIMIT_WINDOW_SEC // 2 + 5  # ~35s
-# Between two different accounts on a single top-up event: avoid bursts
-# that look like a coordinated bot to the CDN / WAF.
-INTER_ACCOUNT_SPACING_SEC = 15
+# Between two different accounts on a single top-up event: keep just
+# enough spacing to avoid sub-second bursts from the same IP.
+INTER_ACCOUNT_SPACING_SEC = 5
 # Stop iterating if hot wallet drops below this mid-sequence — the remaining
 # accounts will almost certainly fail and we'd just burn rate-limit budget.
 HOT_WALLET_FLOOR_LAMPORTS = 200_000  # ~0.0002 SOL

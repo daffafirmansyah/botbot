@@ -28,9 +28,9 @@ from core import (
 )
 
 # Spacing between accounts — the site's per-user rate limit is per-JWT
-# (3 req / 60 s), so different accounts don't share a bucket. The spacing
-# here is to avoid sub-second bursts that look like a bot to the CDN/WAF.
-INTER_ACCOUNT_SPACING_SEC = 15
+# (3 req / 60 s), so different accounts don't share a bucket. Keep this
+# above ~1s to avoid sub-second bursts from the same IP.
+INTER_ACCOUNT_SPACING_SEC = 5
 
 
 def main() -> int:
