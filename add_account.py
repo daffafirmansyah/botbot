@@ -337,6 +337,58 @@ def remove_accounts(data: dict, spec: str, skip_confirm: bool) -> int:
 # Bulk import
 # ---------------------------------------------------------------------------
 
+def _merge_broken_rows(lines: list[str], delimiter: str, expected_cols: int) -> tuple[list[str], int]:
+    """Re-assemble physical lines into logical rows when a value (usually a
+    cookie or JWT pasted from a browser) contained a literal newline that
+    caused one logical row to be split across multiple physical lines.
+
+    Algorithm: walk the lines in order. Any line with fewer than
+    (expected_cols - 1) delimiters is considered incomplete and is
+    concatenated with the following non-empty line(s) — without inserting
+    any separator, because the newline that split the row was inside a
+    single value, not between two fields — until the delimiter count is
+    satisfied or we run out of lines.
+
+    Returns (merged_lines, num_physical_lines_absorbed).
+    """
+    expected_delims = expected_cols - 1
+    result: list[str] = []
+    absorbed = 0
+
+    i = 0
+    while i < len(lines):
+        current = lines[i]
+
+        # Skip blank lines outright.
+        if not current.strip():
+            i += 1
+            continue
+
+        # Already a complete row.
+        if current.count(delimiter) >= expected_delims:
+            result.append(current)
+            i += 1
+            continue
+
+        # Incomplete: greedily consume following physical lines until we
+        # reach the expected delimiter count.
+        merged = current
+        j = i + 1
+        while j < len(lines) and merged.count(delimiter) < expected_delims:
+            nxt = lines[j]
+            if not nxt.strip():
+                j += 1
+                continue
+            merged = merged + nxt
+            j += 1
+
+        result.append(merged)
+        absorbed += max(0, (j - i) - 1)
+        i = j if j > i else i + 1
+
+    return result, absorbed
+
+
 def bulk_import(data: dict, tsv_path: Path) -> int:
     if not tsv_path.exists():
         sys.exit(f"[error] bulk file not found: {tsv_path}")
@@ -351,7 +403,23 @@ def bulk_import(data: dict, tsv_path: Path) -> int:
     else:
         delimiter = ","
 
-    reader = csv.DictReader(text.splitlines(), delimiter=delimiter)
+    raw_lines = text.splitlines()
+    # Header stays as-is (line 0); merge only the data rows below.
+    if raw_lines:
+        header_line = raw_lines[0]
+        data_lines, absorbed = _merge_broken_rows(
+            raw_lines[1:], delimiter, len(REQUIRED_FIELDS)
+        )
+        if absorbed > 0:
+            print(
+                f"  [info] auto-merged {absorbed} extra physical line(s) back "
+                f"into their logical rows (newline embedded in a value)."
+            )
+        merged_lines = [header_line] + data_lines
+    else:
+        merged_lines = raw_lines
+
+    reader = csv.DictReader(merged_lines, delimiter=delimiter)
     if reader.fieldnames is None:
         sys.exit("[error] bulk file appears empty or has no header row.")
     header_set = {h.strip() for h in reader.fieldnames}
