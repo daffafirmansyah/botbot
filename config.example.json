@@ -1,0 +1,6 @@
+{
+  "bearer_token": "PASTE_JWT_WITHOUT_BEARER_PREFIX",
+  "cookie": "GAESA=PASTE_FULL_COOKIE_VALUE_HERE",
+  "wallet_address": "YOUR_SOLANA_WALLET_ADDRESS",
+  "amount_sol": 0.0033999998
+}

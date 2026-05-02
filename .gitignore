@@ -1,0 +1,8 @@
+config.json
+state.json
+withdraw.log
+monitor.log
+__pycache__/
+*.pyc
+.venv/
+venv/
