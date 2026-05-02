@@ -93,7 +93,8 @@ def _read_config_file() -> dict:
         sys.exit(EXIT_CONFIG)
 
     try:
-        return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        # utf-8-sig tolerates a BOM if Notepad / PowerShell created the file.
+        return json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
     except json.JSONDecodeError as e:
         print(f"[error] config.json is not valid JSON: {e}", file=sys.stderr)
         sys.exit(EXIT_CONFIG)

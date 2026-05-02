@@ -1,5 +1,7 @@
 config.json
 state.json
+accounts.tsv
+accounts.csv
 withdraw.log
 monitor.log
 __pycache__/

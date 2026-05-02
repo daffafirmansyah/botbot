@@ -91,6 +91,42 @@ separately. Twitter / OAuth auto-login is **not** supported by design.
 
 `config.json` is gitignored — don't commit it.
 
+### Adding many accounts (helper)
+
+Editing `config.json` by hand for 50+ entries is error-prone. Use the
+helper script:
+
+**Interactive mode** (paste 4 fields per account, loops until you stop):
+
+```powershell
+python add_account.py
+```
+
+The prompts auto-strip a `Bearer ` prefix, suggest the next free
+`accN` name, and reuse the previously-entered `wallet_address` and
+`amount_sol` as defaults — so for accounts that share a destination
+wallet you usually only need to paste the bearer + cookie. Saved after
+every add, so Ctrl+C is safe.
+
+**Bulk import** from a tab-separated file:
+
+```powershell
+python add_account.py --bulk accounts.tsv
+```
+
+`accounts.tsv` must have a header row with exactly these columns
+(order doesn't matter, tabs or commas both accepted):
+
+```
+name	bearer_token	cookie	wallet_address	amount_sol
+acc1	eyJhbG...	GAESA=...	24Kgco...	0.0033999998
+acc2	eyJhbG...	GAESA=...	24Kgco...	0.0033999998
+```
+
+Build the file from your password manager / spreadsheet of extracted
+credentials. Existing accounts are preserved; duplicates by `name`
+are rejected with a clear message and the rest still import.
+
 ## Run: one-shot mode
 
 ```powershell
@@ -288,8 +324,9 @@ once. Multi-account compounds that risk; it doesn't distribute it.
 | File | Purpose |
 | --- | --- |
 | `core.py` | Shared helpers: HTTP POST, Solana RPC, state persistence, account loading. |
-| `withdraw.py` | One-shot entry point. Iterates accounts, one POST each. |
+| `withdraw.py` | One-shot entry point. Fires every account once (parallel by default). |
 | `monitor.py` | Watch-loop entry point. Polls hot wallet, fires eligible accounts on top-up. |
+| `add_account.py` | Interactive / bulk helper to append accounts to `config.json` safely. |
 | `config.example.json` | Template. Copy to `config.json` and fill. |
 | `config.json` | Your real credentials, multi-account (gitignored). |
 | `state.json` | Per-account persisted state (gitignored). |
