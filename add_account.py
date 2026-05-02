@@ -15,6 +15,12 @@ Two modes:
   List existing accounts (without leaking bearer / cookie):
       python add_account.py --list
 
+  Remove account(s) by name or by index from --list:
+      python add_account.py --remove acc1
+      python add_account.py --remove acc1,acc2,acc5
+      python add_account.py --remove 3,7        # by --list index
+      python add_account.py --remove acc1 --yes  # skip confirmation
+
 Bulk file format (header row required, any column order):
 
     name<TAB>bearer_token<TAB>cookie<TAB>wallet_address<TAB>amount_sol
@@ -251,6 +257,63 @@ def list_accounts(data: dict) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Removal
+# ---------------------------------------------------------------------------
+
+def remove_accounts(data: dict, spec: str, skip_confirm: bool) -> int:
+    accounts = data.get("accounts", [])
+    if not accounts:
+        print("No accounts in config.json to remove.")
+        return 1
+
+    targets = [t.strip() for t in spec.split(",") if t.strip()]
+    if not targets:
+        print("[error] --remove value is empty.")
+        return 1
+
+    # Resolve each target (name or 1-based index from --list) to an account name.
+    to_remove: set[str] = set()
+    not_found: list[str] = []
+    name_set = {a.get("name") for a in accounts}
+
+    for t in targets:
+        if t.isdigit():
+            idx = int(t)
+            if 1 <= idx <= len(accounts):
+                to_remove.add(accounts[idx - 1]["name"])
+            else:
+                not_found.append(f"index {t} (valid: 1..{len(accounts)})")
+        elif t in name_set:
+            to_remove.add(t)
+        else:
+            not_found.append(f"name {t!r}")
+
+    if not_found:
+        print(f"[error] not found: {', '.join(not_found)}")
+        return 1
+
+    print(f"\nWill remove {len(to_remove)} account(s):")
+    for n in sorted(to_remove):
+        print(f"  - {n}")
+
+    if not skip_confirm:
+        try:
+            ans = input("\nConfirm? [y/N]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            ans = ""
+        if ans not in ("y", "yes"):
+            print("Aborted. config.json unchanged.")
+            return 1
+
+    new_accounts = [a for a in accounts if a.get("name") not in to_remove]
+    data["accounts"] = new_accounts
+    save_config_data(data)
+    print(f"\nRemoved {len(accounts) - len(new_accounts)} account(s). "
+          f"Total now: {len(new_accounts)}.")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Bulk import
 # ---------------------------------------------------------------------------
 
@@ -331,11 +394,23 @@ def main() -> int:
         action="store_true",
         help="List existing accounts in config.json without printing bearer / cookie values.",
     )
+    ap.add_argument(
+        "--remove",
+        metavar="NAMES_OR_INDICES",
+        help="Remove account(s) by name or 1-based index from --list. Comma-separated.",
+    )
+    ap.add_argument(
+        "--yes",
+        action="store_true",
+        help="Skip the confirmation prompt for --remove.",
+    )
     ns = ap.parse_args()
 
     data = load_config_data()
     if ns.list:
         return list_accounts(data)
+    if ns.remove:
+        return remove_accounts(data, ns.remove, ns.yes)
     if ns.bulk:
         return bulk_import(data, ns.bulk)
     return interactive_loop(data)

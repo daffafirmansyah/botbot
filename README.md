@@ -127,6 +127,28 @@ Build the file from your password manager / spreadsheet of extracted
 credentials. Existing accounts are preserved; duplicates by `name`
 are rejected with a clear message and the rest still import.
 
+### Listing / removing accounts
+
+Show what's currently in `config.json` (without printing bearer /
+cookie values):
+
+```powershell
+python add_account.py --list
+```
+
+Remove one or more accounts (atomic — if any target is invalid,
+nothing is removed):
+
+```powershell
+python add_account.py --remove acc1                # by name
+python add_account.py --remove acc1,acc2,acc5      # several names
+python add_account.py --remove 3,7                 # by 1-based --list index
+python add_account.py --remove acc1 --yes          # skip confirmation prompt
+```
+
+The script prompts for confirmation by default (`Confirm? [y/N]:`).
+Pass `--yes` to skip the prompt in scripts.
+
 ## Run: one-shot mode
 
 ```powershell
