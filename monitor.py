@@ -71,7 +71,9 @@ MAX_PARALLEL_WORKERS = 32            # cap concurrent in-flight POSTs
 # maximum sniping speed but high 429-storm risk — relies on aggressive retry
 # in core.py to recover the misses). Raise to 200/500/2000 if you start
 # seeing IP-level blocks (403 / connection refused, NOT just 429).
-PARALLEL_STAGGER_MS = 0
+# 2ms = still effectively a burst (64 accounts dispatched over ~126ms) but
+# avoids the exact-same-timestamp fingerprint that some WAFs flag.
+PARALLEL_STAGGER_MS = 2
 
 # Sequential fallback (only used if PARALLEL_FIRE = False):
 INTER_ACCOUNT_SPACING_SEC = 5
