@@ -12,6 +12,9 @@ Two modes:
       python add_account.py --bulk accounts.tsv
       -> reads a tab-separated file and imports every row.
 
+  List existing accounts (without leaking bearer / cookie):
+      python add_account.py --list
+
 Bulk file format (header row required, any column order):
 
     name<TAB>bearer_token<TAB>cookie<TAB>wallet_address<TAB>amount_sol
@@ -199,6 +202,55 @@ def interactive_loop(data: dict) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Listing
+# ---------------------------------------------------------------------------
+
+def _shorten_wallet(w: str) -> str:
+    return f"{w[:8]}...{w[-4:]}" if len(w) > 16 else w
+
+
+def _bearer_fingerprint(b: str) -> str:
+    """Show last 6 chars + total length so you can tell tokens apart
+    when rotating, without printing the actual JWT."""
+    if not b:
+        return "(empty)"
+    return f"...{b[-6:]} ({len(b)}c)"
+
+
+def list_accounts(data: dict) -> int:
+    accounts = data.get("accounts", [])
+    if not accounts:
+        print("No accounts in config.json yet.")
+        print(f"  config path: {CONFIG_PATH}")
+        return 0
+
+    print(f"\nTotal accounts: {len(accounts)}  (config: {CONFIG_PATH})\n")
+    header = f"  {'#':>3}  {'name':<12}  {'wallet':<22}  {'amount':<13}  {'bearer':<18}  {'cookie':<6}"
+    print(header)
+    print("  " + "-" * (len(header) - 2))
+    for i, a in enumerate(accounts, 1):
+        name = a.get("name", "?")
+        wallet = _shorten_wallet(a.get("wallet_address", ""))
+        amount = a.get("amount_sol", "?")
+        bearer = _bearer_fingerprint(a.get("bearer_token", ""))
+        cookie = "set" if a.get("cookie") else "MISSING"
+        print(
+            f"  {i:>3}  {name:<12}  {wallet:<22}  {amount!s:<13}  {bearer:<18}  {cookie:<6}"
+        )
+    print()
+
+    # Quick health summary.
+    missing_bearer = sum(1 for a in accounts if not a.get("bearer_token"))
+    missing_cookie = sum(1 for a in accounts if not a.get("cookie"))
+    if missing_bearer or missing_cookie:
+        print(
+            f"  WARN: {missing_bearer} account(s) missing bearer, "
+            f"{missing_cookie} missing cookie."
+        )
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Bulk import
 # ---------------------------------------------------------------------------
 
@@ -274,9 +326,16 @@ def main() -> int:
         type=Path,
         help="Path to a TSV/CSV file with header row (name, bearer_token, cookie, wallet_address, amount_sol).",
     )
+    ap.add_argument(
+        "--list",
+        action="store_true",
+        help="List existing accounts in config.json without printing bearer / cookie values.",
+    )
     ns = ap.parse_args()
 
     data = load_config_data()
+    if ns.list:
+        return list_accounts(data)
     if ns.bulk:
         return bulk_import(data, ns.bulk)
     return interactive_loop(data)
