@@ -35,13 +35,11 @@ from core import (
 PARALLEL_FIRE = True
 MAX_PARALLEL_WORKERS = 20
 # Stagger the parallel dispatch so account #N waits N * PARALLEL_STAGGER_MS
-# before its first request fires. 0 = pure burst (50 reqs in same ms, very
-# high 429-storm risk). 2000 = ~1 req every 2 seconds from one IP — looks
-# like a human clicking 'withdraw' on each tab, almost never trips a per-IP
-# rate-limit. With 50 accounts the dispatch window is 50 * 2 = 100 sec,
-# still well inside a typical 5-15 min topup window. Lower this if you have
-# few accounts (5 accts * 2s = 10s), raise it if you keep seeing 429-storm.
-PARALLEL_STAGGER_MS = 2000
+# before its first request fires. 0 = pure burst (all reqs in same ms,
+# maximum sniping speed but high 429-storm risk — relies on aggressive retry
+# in core.py to recover the misses). Raise to 200/500/2000 if you start
+# seeing IP-level blocks (403 / connection refused, NOT just 429).
+PARALLEL_STAGGER_MS = 0
 
 # Sequential fallback only.
 INTER_ACCOUNT_SPACING_SEC = 5

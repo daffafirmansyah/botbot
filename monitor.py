@@ -64,12 +64,11 @@ PER_ACCOUNT_SPACING_SEC = RATE_LIMIT_WINDOW_SEC // 2 + 5  # ~35s
 PARALLEL_FIRE = True
 MAX_PARALLEL_WORKERS = 20            # cap concurrent in-flight POSTs
 # Stagger the parallel dispatch so account #N waits N * PARALLEL_STAGGER_MS
-# before its first request fires. 2000 = ~1 req every 2 seconds from one IP
-# — looks like a human clicking 'withdraw' on each tab, almost never trips
-# a per-IP rate-limit (Cloudflare / claimyshare WAF). 50 accts * 2s = 100s
-# dispatch window, still inside a typical 5-15 min topup. Lower if you have
-# few accounts and want speed; raise if 429-storm persists.
-PARALLEL_STAGGER_MS = 2000
+# before its first request fires. 0 = pure burst (all reqs in same ms,
+# maximum sniping speed but high 429-storm risk — relies on aggressive retry
+# in core.py to recover the misses). Raise to 200/500/2000 if you start
+# seeing IP-level blocks (403 / connection refused, NOT just 429).
+PARALLEL_STAGGER_MS = 0
 
 # Sequential fallback (only used if PARALLEL_FIRE = False):
 INTER_ACCOUNT_SPACING_SEC = 5

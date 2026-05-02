@@ -52,27 +52,29 @@ DAILY_COOLDOWN_SEC = 23 * 3600 + 55 * 60  # 23h55m
 MIN_WITHDRAW_SOL = 0.0005
 
 # ----- Retry policy for transient failures -----
-# Snipe-mode defaults: retry 429 and 5xx INDEFINITELY. The bot keeps
-# trying until either:
-#   (a) the server returns 2xx success, or
-#   (b) the server returns a 200-OK with "too many withdrawal" message,
-#       which is the 24h daily cooldown — server-enforced, no retry.
+# AGGRESSIVE / SNIPE mode: retry 429 and 5xx as fast as possible. We
+# explicitly IGNORE the server's Retry-After header (which says 30s) and
+# retry every ~2 seconds instead, on the bet that:
+#   - the rate-limit is a sliding window where some slots reopen sooner;
+#   - or that server-side 5xx are transient and recover in seconds.
 #
-# 429 = per-JWT rate-limit (3 req / 60s) — server tells us when via the
-#       Retry-After header. We honor it + jitter, then retry.
-# 5xx = server temporarily unavailable. We back off exponentially up to
-#       a cap so we don't hammer the server during a real outage.
+# !! WARNING: This is louder traffic and can trigger anti-abuse / IP ban.
+# Increase the wait constants below if you start seeing IP-level blocks
+# (everything returning 403 / connection refused) instead of 429.
 #
-# Set MAX_RETRIES_* to a finite int if you want bounded retries instead.
+# 24h daily cooldown (200-OK + "too many withdrawal" message) is STILL
+# never retried — that's a server-enforced lock and retrying is futile.
 MAX_RETRIES_RATE_LIMIT = math.inf      # infinite retries on 429
 MAX_RETRIES_SERVER_ERROR = math.inf    # infinite retries on 5xx
-RETRY_429_FALLBACK_SEC = 30            # used when server omits Retry-After
-RETRY_429_MAX_WAIT_SEC = 3600          # if Retry-After > 1h, server is signaling
-                                       # a long lock, treat as cooldown to free
-                                       # rate-limit budget for other accounts
-SERVER_ERROR_BACKOFF_SEC = (30, 60, 120, 300)  # caps at 5 min between retries
-RETRY_JITTER_SEC = 5                   # random jitter so parallel workers don't
-                                       # sync up
+RETRY_429_FALLBACK_SEC = 2             # used when server omits Retry-After
+RETRY_429_MAX_WAIT_SEC = 2             # CAP on actual wait — overrides server's
+                                       # Retry-After so we don't sit idle 30s
+RETRY_429_COOLDOWN_THRESHOLD_SEC = 3600  # if server says Retry-After > 1h,
+                                         # bail out (it's a real lock, not a
+                                         # short rate-limit window)
+SERVER_ERROR_BACKOFF_SEC = (2, 2, 2, 2)  # flat 2s wait, no escalation
+RETRY_JITTER_SEC = 1                     # small jitter to desync parallel
+                                         # workers when they all retry
 
 Logger = Callable[[str], None]
 
@@ -595,15 +597,20 @@ def attempt_withdraw(
 
             # Long Retry-After (server explicitly says "wait hours") => not a
             # short rate-limit, treat as cooldown and bail.
-            if retry_after > RETRY_429_MAX_WAIT_SEC:
+            if retry_after > RETRY_429_COOLDOWN_THRESHOLD_SEC:
                 log(
                     f"[{name}] [cooldown] 429 retry-after={retry_after}s "
-                    f"exceeds {RETRY_429_MAX_WAIT_SEC}s; treating as cooldown."
+                    f"exceeds {RETRY_429_COOLDOWN_THRESHOLD_SEC}s; "
+                    f"treating as cooldown."
                 )
                 return EXIT_COOLDOWN, parsed, status
 
+            # Aggressive mode: cap the wait at RETRY_429_MAX_WAIT_SEC so we
+            # don't sit idle for the full 30s the server politely asks for.
+            effective_wait = min(retry_after, RETRY_429_MAX_WAIT_SEC)
+
             if rate_limit_retries_left > 0:
-                wait = retry_after + random.uniform(0, RETRY_JITTER_SEC)
+                wait = effective_wait + random.uniform(0, RETRY_JITTER_SEC)
                 rate_limit_retries_left -= 1
                 left_str = (
                     "unlimited"
