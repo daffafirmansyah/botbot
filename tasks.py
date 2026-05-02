@@ -1,24 +1,33 @@
 """
-Claimyshare auto social-tasks — one-shot mode.
+Claimyshare auto social-tasks — one-shot mode (Phase 1).
 
 For every account in config.json:
   1. GET  /api/tasks                  -> list of available tasks
   2. Filter to follow/like task types  -> skip everything else (Register, etc.)
   3. POST /api/tasks/complete          -> {"taskId": <id>}, one at a time
-  4. Wait TASK_INTER_DELAY_SEC seconds between tasks so the backend has time
-     to verify the follow/like against X's API. Hitting too fast triggers
-     "still verifying" / rate-limit responses.
+  4. Classify the response by message content:
+        - "Task completed"           -> reward claimed (success)
+        - "You are not following"    -> needs real X follow first
+        - "You haven't liked"        -> needs real X like first
+        - "already completed"        -> silent no-op
+        - other                      -> error, log full body
+  5. Tasks that need a real X action are written to pending_x.json so the
+     Phase 2 module (x_auto.py — TODO) can pick them up later.
 
-This script ASSUMES you have already followed/liked the targets manually on
-X (twitter.com). The bot only claims the reward; it does NOT do the actual
-follow/like for you. Tasks the backend cannot verify (e.g. you haven't
-followed yet) are logged and skipped — re-run later to pick them up.
+IMPORTANT: this script does NOT do the actual follow/like on X. If a task
+requires a real follow you haven't done yet, claimyshare will reject the
+claim — bot will skip it and write the target to pending_x.json. Run again
+after you've followed (or after Phase 2 has done it for you).
 
 Examples:
   python tasks.py                    # all accounts, sequential
   python tasks.py --parallel         # all accounts, parallel + stagger
   python tasks.py --name acc1        # only one account
   python tasks.py --dry-run          # list eligible tasks, don't POST
+
+Outputs:
+  tasks.log         human-readable log
+  pending_x.json    machine-readable list of pending follow/like targets
 
 Exit code:
   0 if at least one task was completed across all accounts,
@@ -28,15 +37,18 @@ Exit code:
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 
 import requests
 
 from core import (
     EXIT_API_ERROR,
     EXIT_OK,
+    SCRIPT_DIR,
     build_headers,
     load_accounts,
     make_logger,
@@ -70,6 +82,32 @@ HTTP_TIMEOUT_SEC = 20
 MAX_PARALLEL_WORKERS = 8
 PARALLEL_STAGGER_MS = 500   # delay between account workers starting
 
+# Output file for tasks that need a real follow/like on X. Phase 2 (x_auto.py)
+# will consume this. Gitignored — never commit.
+PENDING_X_PATH = SCRIPT_DIR / "pending_x.json"
+
+# Response classification — keywords matched (case-insensitive) against the
+# response 'message' field. Order doesn't matter; first match wins.
+_OK_KEYWORDS = ("task completed",)
+_NEED_FOLLOW_KEYWORDS = (
+    "not following this account",
+    "please follow and try",
+)
+_NEED_LIKE_KEYWORDS = (
+    "haven't liked",
+    "have not liked",
+    "please like and try",
+)
+_ALREADY_DONE_KEYWORDS = (
+    "already completed",
+    "already claimed",
+)
+_THROTTLED_KEYWORDS = (
+    "still verifying",
+    "try again later",
+    "too many requests",
+)
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -93,6 +131,76 @@ def _is_eligible(task: dict) -> bool:
     if task.get("done") is True:
         return False
     return True
+
+
+def _classify_response(status: int, body: dict | None) -> str:
+    """
+    Classify the /api/tasks/complete response into a coarse outcome.
+
+    Returns one of:
+      "ok"           -> reward claimed
+      "need-follow"  -> backend says we haven't followed the target on X yet
+      "need-like"    -> backend says we haven't liked the tweet on X yet
+      "already-done" -> task was already completed earlier
+      "throttled"    -> verification still in progress / soft rate limit
+      "error"        -> anything else, including network failures
+    """
+    msg = ""
+    if isinstance(body, dict):
+        msg = str(body.get("message") or body.get("error") or "").lower()
+
+    if 200 <= status < 300 and any(k in msg for k in _OK_KEYWORDS):
+        return "ok"
+    if any(k in msg for k in _NEED_FOLLOW_KEYWORDS):
+        return "need-follow"
+    if any(k in msg for k in _NEED_LIKE_KEYWORDS):
+        return "need-like"
+    if any(k in msg for k in _ALREADY_DONE_KEYWORDS):
+        return "already-done"
+    if status == 429 or any(k in msg for k in _THROTTLED_KEYWORDS):
+        return "throttled"
+    return "error"
+
+
+def _build_pending_entry(task: dict, outcome: str) -> dict | None:
+    """
+    Build a pending_x.json entry from a task object the bot couldn't claim
+    yet because it needs a real X action. Returns None if the task doesn't
+    have enough info to act on.
+    """
+    if outcome not in ("need-follow", "need-like"):
+        return None
+
+    action = "follow" if outcome == "need-follow" else "like"
+    # verificationTarget is the canonical pointer:
+    #   - for follow: "@handle"
+    #   - for like:   tweet ID (numeric string)
+    # Fall back to parsing `url` if verificationTarget is missing.
+    target = task.get("verificationTarget")
+    url = task.get("url") or ""
+    if not target and url:
+        if action == "follow":
+            # https://x.com/<handle>  ->  @<handle>
+            tail = url.rstrip("/").split("/")[-1]
+            target = f"@{tail}" if tail else None
+        else:
+            # https://x.com/<user>/status/<id>?s=20  ->  <id>
+            parts = url.split("/status/")
+            if len(parts) == 2:
+                target = parts[1].split("?")[0].split("/")[0] or None
+
+    if not target:
+        return None
+
+    return {
+        "task_id": task.get("id"),
+        "title": task.get("title"),
+        "action": action,
+        "target": target,
+        "url": url or None,
+        "reward_sol": task.get("rewardSol"),
+        "verification_type": task.get("verificationType"),
+    }
 
 
 def _fmt_reward(parsed: dict | None) -> str:
@@ -160,17 +268,37 @@ def complete_task(
 
 
 def process_account(acc: dict, log, dry_run: bool) -> dict:
-    """Walk one account's task list and POST complete on each eligible task."""
+    """
+    Walk one account's task list and POST complete on each eligible task.
+
+    Returns a per-account result dict with counters and a `pending_x` list
+    of follow/like targets the user still needs to perform on X (consumed
+    later by Phase 2).
+    """
     name = acc.get("name", "?")
     bearer = acc["bearer_token"]
     cookie = acc["cookie"]
+
+    empty_result = {
+        "name": name,
+        "ok": 0,
+        "need_follow": 0,
+        "need_like": 0,
+        "already_done": 0,
+        "throttled": 0,
+        "error": 0,
+        "skipped_other": 0,
+        "reward_sol": 0.0,
+        "pending_x": [],
+    }
 
     log(f"[{name}] fetching tasks list...")
     try:
         tasks = fetch_tasks(bearer, cookie)
     except Exception as e:  # noqa: BLE001
         log(f"[{name}] [error] failed to fetch tasks: {e}")
-        return {"name": name, "ok": 0, "fail": 0, "skipped": 0, "reward_sol": 0.0}
+        empty_result["error"] = 1
+        return empty_result
 
     eligible = [t for t in tasks if _is_eligible(t)]
     other = len(tasks) - len(eligible)
@@ -180,51 +308,78 @@ def process_account(acc: dict, log, dry_run: bool) -> dict:
         f"{other} skipped (other types or already done)."
     )
 
-    if not eligible:
-        return {"name": name, "ok": 0, "fail": 0, "skipped": other, "reward_sol": 0.0}
+    result = dict(empty_result)
+    result["skipped_other"] = other
 
-    ok = 0
-    fail = 0
-    reward_sol_total = 0.0
+    if not eligible:
+        return result
 
     for i, task in enumerate(eligible):
         tid = task.get("id")
         title = task.get("title", "?")
         expected = task.get("rewardSol", "?")
 
-        if i > 0:
+        # Only sleep between real POSTs; dry-run finishes instantly.
+        if i > 0 and not dry_run:
             log(f"[{name}] sleeping {TASK_INTER_DELAY_SEC}s before next task...")
             time.sleep(TASK_INTER_DELAY_SEC)
 
         if dry_run:
-            log(f"[{name}] [dry-run] would POST taskId={tid} ('{title}', "
-                f"expected +{expected} SOL).")
+            log(
+                f"[{name}] [dry-run] would POST taskId={tid} ('{title}', "
+                f"expected +{expected} SOL, verify={task.get('verificationType')})."
+            )
             continue
 
         log(f"[{name}] posting taskId={tid} ('{title}')...")
         status, body = complete_task(bearer, cookie, tid)
+        outcome = _classify_response(status, body)
 
-        if 200 <= status < 300 and isinstance(body, dict) \
-                and str(body.get("message", "")).lower() == "task completed":
-            ok += 1
+        if outcome == "ok":
+            result["ok"] += 1
             try:
-                reward_sol_total += float(body.get("rewardSol") or 0)
+                result["reward_sol"] += float(
+                    (body or {}).get("rewardSol") or 0
+                )
             except (TypeError, ValueError):
                 pass
             log(f"[{name}] [ok] task {tid} '{title}' -> {_fmt_reward(body)}")
-        else:
-            fail += 1
-            # Most common reasons: backend says you haven't followed yet, or
-            # task is mid-verification. We do NOT retry — user re-runs later.
-            log(f"[{name}] [skip] task {tid} '{title}' status={status} body={body}")
 
-    return {
-        "name": name,
-        "ok": ok,
-        "fail": fail,
-        "skipped": other,
-        "reward_sol": reward_sol_total,
-    }
+        elif outcome == "need-follow":
+            result["need_follow"] += 1
+            entry = _build_pending_entry(task, outcome)
+            if entry:
+                result["pending_x"].append(entry)
+            target = (entry or {}).get("target", task.get("verificationTarget", "?"))
+            log(f"[{name}] [need-follow] task {tid} '{title}' -> follow {target} on X")
+
+        elif outcome == "need-like":
+            result["need_like"] += 1
+            entry = _build_pending_entry(task, outcome)
+            if entry:
+                result["pending_x"].append(entry)
+            target = (entry or {}).get("target", task.get("verificationTarget", "?"))
+            log(f"[{name}] [need-like] task {tid} '{title}' -> like tweet {target} on X")
+
+        elif outcome == "already-done":
+            result["already_done"] += 1
+            log(f"[{name}] [already-done] task {tid} '{title}' (server says claimed before)")
+
+        elif outcome == "throttled":
+            result["throttled"] += 1
+            log(
+                f"[{name}] [throttled] task {tid} '{title}' "
+                f"status={status} body={body} — re-run later."
+            )
+
+        else:  # "error"
+            result["error"] += 1
+            log(
+                f"[{name}] [error] task {tid} '{title}' "
+                f"status={status} body={body}"
+            )
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -298,6 +453,47 @@ def _parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def _write_pending_x(results: list[dict], log) -> None:
+    """
+    Aggregate pending_x entries from every account result and write them to
+    PENDING_X_PATH for Phase 2 (x_auto.py) to consume. Skips writing if no
+    pending actions exist (also removes any stale file).
+    """
+    payload_accounts: dict[str, list] = {}
+    for r in results:
+        pending = r.get("pending_x") or []
+        if pending:
+            payload_accounts[r["name"]] = pending
+
+    if not payload_accounts:
+        # Nothing pending — clean up any stale file so Phase 2 doesn't act on
+        # outdated targets.
+        if PENDING_X_PATH.exists():
+            try:
+                PENDING_X_PATH.unlink()
+                log(f"[pending-x] removed stale {PENDING_X_PATH.name} (nothing pending).")
+            except OSError as e:
+                log(f"[pending-x] could not remove stale {PENDING_X_PATH.name}: {e}")
+        return
+
+    payload = {
+        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "accounts": payload_accounts,
+    }
+    try:
+        PENDING_X_PATH.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        total = sum(len(v) for v in payload_accounts.values())
+        log(
+            f"[pending-x] wrote {total} pending action(s) across "
+            f"{len(payload_accounts)} account(s) to {PENDING_X_PATH.name}."
+        )
+    except OSError as e:
+        log(f"[pending-x] FAILED to write {PENDING_X_PATH.name}: {e}")
+
+
 def main() -> int:
     args = _parse_args()
     accounts = load_accounts()
@@ -322,23 +518,45 @@ def main() -> int:
     else:
         results = _run_sequential(accounts, log, args.dry_run)
 
-    # ----- Summary -----
-    total_ok = sum(r["ok"] for r in results)
-    total_fail = sum(r["fail"] for r in results)
-    total_skipped = sum(r["skipped"] for r in results)
-    total_reward = sum(r["reward_sol"] for r in results)
-
+    # ----- Per-account summary -----
     log("=== summary ===")
     for r in results:
         log(
-            f"  {r['name']}: ok={r['ok']} fail={r['fail']} "
-            f"other_skipped={r['skipped']} reward=+{r['reward_sol']:.6f} SOL"
+            f"  {r['name']}: ok={r['ok']} "
+            f"need-follow={r['need_follow']} need-like={r['need_like']} "
+            f"already-done={r['already_done']} throttled={r['throttled']} "
+            f"error={r['error']} other-skipped={r['skipped_other']} "
+            f"reward=+{r['reward_sol']:.6f} SOL"
         )
+
+    # ----- Aggregate totals -----
+    total_ok = sum(r["ok"] for r in results)
+    total_need_follow = sum(r["need_follow"] for r in results)
+    total_need_like = sum(r["need_like"] for r in results)
+    total_already = sum(r["already_done"] for r in results)
+    total_throttled = sum(r["throttled"] for r in results)
+    total_error = sum(r["error"] for r in results)
+    total_reward = sum(r["reward_sol"] for r in results)
+
     log(
-        f"TOTAL: ok={total_ok} fail={total_fail} "
-        f"other_skipped={total_skipped} reward=+{total_reward:.6f} SOL "
-        f"across {len(results)} account(s)."
+        f"TOTAL across {len(results)} account(s): "
+        f"ok={total_ok} need-follow={total_need_follow} "
+        f"need-like={total_need_like} already-done={total_already} "
+        f"throttled={total_throttled} error={total_error} "
+        f"reward=+{total_reward:.6f} SOL"
     )
+
+    # ----- Print pending actions banner (human-friendly) -----
+    if (total_need_follow + total_need_like) > 0:
+        log("=== pending X actions (need real follow/like) ===")
+        for r in results:
+            for p in r.get("pending_x") or []:
+                log(f"  {r['name']}: {p['action']} {p['target']} "
+                    f"(task {p['task_id']}, +{p.get('reward_sol', 0)} SOL)")
+
+    # ----- Write Phase-2 input file -----
+    if not args.dry_run:
+        _write_pending_x(results, log)
 
     return EXIT_OK if total_ok > 0 else EXIT_API_ERROR
 
