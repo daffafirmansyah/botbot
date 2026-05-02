@@ -127,10 +127,72 @@ def _eligible_accounts(accounts: list[dict], state: dict, now: float) -> list[di
 
 
 def _bootstrap_accounts(accounts: list[dict], state: dict, log) -> None:
-    """On first-ever run, fill last_success_at for each account from chain."""
+    """
+    On first-ever run, fill last_success_at for each account from chain.
+
+    Accounts that SHARE a wallet_address with any other account are SKIPPED:
+    bootstrap can only see the on-chain destination, so a single incoming tx
+    to that wallet would be (incorrectly) attributed to every account using
+    it, poisoning the cooldown state. We leave last_success_at = None for
+    those accounts (treating them as "ready") and rely on per-attempt state
+    updates once the bot actually fires.
+
+    Only accounts whose wallet_address is unique across the list get the
+    chain-scan treatment.
+    """
+    # Count how many accounts use each destination wallet.
+    wallet_count: dict[str, int] = {}
+    for acc in accounts:
+        w = acc.get("wallet_address", "")
+        wallet_count[w] = wallet_count.get(w, 0) + 1
+
+    shared_wallets: dict[str, list[str]] = {}
+    for acc in accounts:
+        w = acc.get("wallet_address", "")
+        if wallet_count.get(w, 0) > 1:
+            shared_wallets.setdefault(w, []).append(acc["name"])
+
+    # Report shared-wallet groups once, up front, and heal any stale
+    # last_success_at left over from earlier (pre-fix) bootstrap runs.
+    for wallet, names in shared_wallets.items():
+        preview = ", ".join(names[:3])
+        if len(names) > 3:
+            preview += f", ... +{len(names) - 3} more"
+        log(
+            f"[bootstrap-skip] wallet {wallet[:8]}...{wallet[-4:]} is shared "
+            f"by {len(names)} account(s) [{preview}]; on-chain scan can't "
+            "distinguish them, leaving cooldown untracked until first fire."
+        )
+
+        # Heal: if none of the accounts in this group have ever been fired
+        # by monitor.py (last_attempt_ts == 0 for all), any existing
+        # last_success_at on them is definitely a bootstrap artifact from
+        # a previous (pre-fix) run — safe to clear. If ANY account has a
+        # real attempt history, we leave the group alone to avoid wiping
+        # legitimate per-account cooldowns.
+        entries = [get_account_state(state, n) for n in names]
+        never_fired = all(
+            float(e.get("last_attempt_ts", 0.0) or 0.0) == 0.0 for e in entries
+        )
+        poisoned = [
+            n for n, e in zip(names, entries)
+            if e.get("last_success_at") is not None
+        ]
+        if never_fired and poisoned:
+            log(
+                f"[bootstrap-heal] clearing stale last_success_at on "
+                f"{len(poisoned)} account(s) under {wallet[:8]}...{wallet[-4:]} "
+                "(bootstrap artifact from a previous run)."
+            )
+            for entry in entries:
+                entry["last_success_at"] = None
+
+    # Scan chain only for accounts with a unique destination wallet.
     for acc in accounts:
         entry = get_account_state(state, acc["name"])
         if entry["last_success_at"] is not None:
+            continue
+        if wallet_count.get(acc.get("wallet_address", ""), 0) > 1:
             continue
         log(f"[{acc['name']}] [bootstrap] scanning chain for last hot-wallet payout...")
         discovered = bootstrap_last_success_iso(acc["wallet_address"], log)
