@@ -34,26 +34,40 @@ from core import (
 # back to a sequential loop with INTER_ACCOUNT_SPACING_SEC between requests.
 PARALLEL_FIRE = True
 MAX_PARALLEL_WORKERS = 20
+# Stagger the parallel dispatch so account #N waits N * PARALLEL_STAGGER_MS
+# before its first request fires. 0 = pure burst (50 reqs in same ms, high
+# 429-storm risk). 200 = smooth ~5 req/sec rate from one IP, much friendlier
+# to Cloudflare / WAF anti-abuse heuristics. With 50 accounts the dispatch
+# window becomes 50 * 0.2 = 10 sec — still well within a 5-15 min topup window.
+PARALLEL_STAGGER_MS = 200
 
 # Sequential fallback only.
 INTER_ACCOUNT_SPACING_SEC = 5
 
 
-def _fire_one(acc: dict, log) -> int:
+def _fire_one(acc: dict, log, start_delay_sec: float = 0.0) -> int:
+    if start_delay_sec > 0:
+        time.sleep(start_delay_sec)
     log(f"[{acc['name']}] [fire] starting withdraw.")
     exit_code, _parsed, _status = attempt_withdraw(acc, log, verify_onchain=False)
     return exit_code
 
 
 def _run_parallel(accounts: list[dict], log) -> list[int]:
+    stagger = max(PARALLEL_STAGGER_MS, 0) / 1000.0
+    total_dispatch = stagger * (len(accounts) - 1)
     log(
-        f"[parallel] firing {len(accounts)} account(s) simultaneously "
-        f"(max workers={MAX_PARALLEL_WORKERS})."
+        f"[parallel] firing {len(accounts)} account(s) "
+        f"(max workers={MAX_PARALLEL_WORKERS}, "
+        f"stagger={PARALLEL_STAGGER_MS}ms => dispatch window {total_dispatch:.1f}s)."
     )
     workers = min(MAX_PARALLEL_WORKERS, len(accounts))
     results: list[int] = []
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="wd") as ex:
-        futures = [ex.submit(_fire_one, acc, log) for acc in accounts]
+        futures = [
+            ex.submit(_fire_one, acc, log, i * stagger)
+            for i, acc in enumerate(accounts)
+        ]
         for fut in as_completed(futures):
             try:
                 results.append(fut.result())

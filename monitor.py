@@ -63,6 +63,12 @@ PER_ACCOUNT_SPACING_SEC = RATE_LIMIT_WINDOW_SEC // 2 + 5  # ~35s
 # Trade-off: makes the burst pattern from one IP more visible to WAF.
 PARALLEL_FIRE = True
 MAX_PARALLEL_WORKERS = 20            # cap concurrent in-flight POSTs
+# Stagger the parallel dispatch so account #N waits N * PARALLEL_STAGGER_MS
+# before its first request fires. Smooths a 50-acct burst into ~5 req/sec
+# from one IP so Cloudflare/WAF anti-abuse doesn't see DDoS-shaped traffic.
+# 50 accts * 200ms = 10s dispatch window — still well within a 5-15 min topup.
+# Set 0 to disable (pure burst).
+PARALLEL_STAGGER_MS = 200
 
 # Sequential fallback (only used if PARALLEL_FIRE = False):
 INTER_ACCOUNT_SPACING_SEC = 5
@@ -164,8 +170,17 @@ def _record_attempt_outcome(
         log(f"[{acc['name']}] [error] failed (exit={exit_code}); keep cooldown unchanged.")
 
 
-def _fire_one_threaded(acc: dict, state: dict, state_lock: threading.Lock, log) -> tuple[dict, int]:
-    """Worker thread body: mark attempt, fire, update state safely."""
+def _fire_one_threaded(
+    acc: dict,
+    state: dict,
+    state_lock: threading.Lock,
+    log,
+    start_delay_sec: float = 0.0,
+) -> tuple[dict, int]:
+    """Worker thread body: optional initial delay (for staggered dispatch),
+    then mark attempt, fire, update state safely."""
+    if start_delay_sec > 0:
+        time.sleep(start_delay_sec)
     with state_lock:
         entry = get_account_state(state, acc["name"])
         entry["last_attempt_ts"] = time.time()
@@ -181,15 +196,20 @@ def _process_topup_parallel(
     state: dict,
     log,
 ) -> None:
-    log(f"[parallel] firing {len(eligible)} account(s) simultaneously "
-        f"(max workers={MAX_PARALLEL_WORKERS}).")
+    stagger = max(PARALLEL_STAGGER_MS, 0) / 1000.0
+    total_dispatch = stagger * (len(eligible) - 1)
+    log(
+        f"[parallel] firing {len(eligible)} account(s) "
+        f"(max workers={MAX_PARALLEL_WORKERS}, "
+        f"stagger={PARALLEL_STAGGER_MS}ms => dispatch window {total_dispatch:.1f}s)."
+    )
     state_lock = threading.Lock()
     workers = min(MAX_PARALLEL_WORKERS, len(eligible))
 
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="wd") as ex:
         futures = [
-            ex.submit(_fire_one_threaded, acc, state, state_lock, log)
-            for acc in eligible
+            ex.submit(_fire_one_threaded, acc, state, state_lock, log, i * stagger)
+            for i, acc in enumerate(eligible)
         ]
         for fut in as_completed(futures):
             try:

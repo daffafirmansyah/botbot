@@ -309,15 +309,17 @@ Tunables (top of `monitor.py`):
 | `TOPUP_THRESHOLD_LAMPORTS` | 500,000 (0.0005 SOL) | Ignore dust / tx-fee noise; only react to real refills. |
 | `PARALLEL_FIRE` | True | Fire eligible accounts concurrently. Set False for sequential. |
 | `MAX_PARALLEL_WORKERS` | 20 | Cap on concurrent in-flight POSTs in parallel mode. |
+| `PARALLEL_STAGGER_MS` | 200 | Per-account dispatch offset in parallel mode. Smooths the burst into ~5 req/sec from one IP — friendly to Cloudflare / WAF. Set 0 for pure burst. |
 | `PER_ACCOUNT_SPACING_SEC` | ~35 | Min gap between two attempts on the **same** account (3/60 s rate limit). |
 | `INTER_ACCOUNT_SPACING_SEC` | 5 | (Sequential mode only) gap between two **different** accounts. |
 | `HOT_WALLET_FLOOR_LAMPORTS` | 200,000 (0.0002 SOL) | Pre-flight floor: abort batch if hot wallet already below this. |
 
-Parallel firing trade-off: ~50 accounts complete in ~1 s instead of
-~4 minutes, dramatically increasing the chance of getting paid before
-the hot wallet drains. The downside is the request burst from a single
-IP is more visible to a CDN / WAF; if the site flips on aggressive
-bot detection later, this is the first knob to revert.
+Parallel firing trade-off: 50 accounts complete dispatch in ~10 s
+(`50 * 200ms`) instead of ~4 minutes sequential — well within the
+typical 5-15 min hot-wallet topup window — while the staggered cadence
+avoids looking like a DDoS to anti-abuse systems. To go faster set
+`PARALLEL_STAGGER_MS = 0` (pure burst, higher 429-storm risk). To go
+gentler raise it to `500` (50 accts * 0.5s = 25s dispatch).
 
 ### Keep it running
 
