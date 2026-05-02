@@ -49,8 +49,13 @@ X_WEB_BEARER = (
     "1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA"
 )
 
-# Lightweight authenticated endpoint that returns the current user's
-# settings (including screen_name). 200 = valid cookies, 401/403 = not.
+# Two-stage probe:
+#   1. GET HOME_URL with cookies. If we end up authenticated (no redirect
+#      to login), the cookies are valid — this is the canonical signal.
+#   2. Best-effort SETTINGS_URL fetch to grab the linked X screen_name
+#      so the user can sanity-check the mapping. If this stage fails it
+#      does NOT mark the account invalid — stage 1 is authoritative.
+HOME_URL = "https://x.com/home"
 SETTINGS_URL = "https://x.com/i/api/1.1/account/settings.json"
 
 USER_AGENT = (
@@ -83,10 +88,57 @@ def _load_x_accounts() -> list[dict]:
         return list(csv.DictReader(f, delimiter="\t"))
 
 
-def _probe_one(auth_token: str, ct0: str) -> dict:
+def _check_home(auth_token: str, ct0: str) -> dict:
     """
-    Hit /1.1/account/settings.json with the given cookies. Returns a dict
-    with 'status' set to 'ok', 'invalid', or 'error'.
+    Stage 1: GET https://x.com/home with the cookies and check the result.
+    A logged-in session lands on /home (200). A logged-out session is
+    redirected to /login or /i/flow/login (3xx).
+    """
+    cookies = {"auth_token": auth_token, "ct0": ct0}
+    headers = {
+        "user-agent": USER_AGENT,
+        "accept": (
+            "text/html,application/xhtml+xml,application/xml;q=0.9,"
+            "image/webp,*/*;q=0.8"
+        ),
+        "accept-language": "en-US,en;q=0.9",
+        "upgrade-insecure-requests": "1",
+    }
+    try:
+        resp = requests.get(
+            HOME_URL,
+            cookies=cookies,
+            headers=headers,
+            allow_redirects=False,
+            timeout=HTTP_TIMEOUT_SEC,
+        )
+    except requests.RequestException as e:
+        return {"status": "error", "details": f"network: {e}"}
+
+    # 3xx -> not logged in (redirected to login flow).
+    if 300 <= resp.status_code < 400:
+        loc = (resp.headers.get("location") or "").lower()
+        if "login" in loc or "flow" in loc or "i/flow" in loc:
+            return {"status": "invalid", "details": f"redirected to {loc}"}
+        # Some unrelated redirect — treat as logged in (e.g. 302 to /).
+        return {"status": "ok"}
+
+    if resp.status_code == 200:
+        return {"status": "ok"}
+
+    # 401, 403, 5xx etc.
+    return {
+        "status": "invalid",
+        "http": resp.status_code,
+        "details": f"unexpected status {resp.status_code}",
+    }
+
+
+def _try_screen_name(auth_token: str, ct0: str) -> str | None:
+    """
+    Stage 2 (best effort): try to fetch the X screen_name linked to these
+    cookies via the legacy settings endpoint. Returns None if the call
+    fails for any reason — this stage is purely informational.
     """
     headers = {
         "authorization": f"Bearer {X_WEB_BEARER}",
@@ -98,35 +150,36 @@ def _probe_one(auth_token: str, ct0: str) -> dict:
         "cookie": f"auth_token={auth_token}; ct0={ct0}",
         "accept": "*/*",
         "accept-language": "en-US,en;q=0.9",
-        "referer": "https://x.com/",
+        "referer": "https://x.com/home",
+        "origin": "https://x.com",
     }
     try:
         resp = requests.get(
             SETTINGS_URL, headers=headers, timeout=HTTP_TIMEOUT_SEC
         )
-    except requests.RequestException as e:
-        return {"status": "error", "details": f"network: {e}"}
-
-    try:
+        if resp.status_code != 200:
+            return None
         body = resp.json()
-    except ValueError:
-        body = {"raw": resp.text[:200]}
+        return body.get("screen_name") if isinstance(body, dict) else None
+    except Exception:  # noqa: BLE001
+        return None
 
-    if (
-        resp.status_code == 200
-        and isinstance(body, dict)
-        and body.get("screen_name")
-    ):
-        return {
-            "status": "ok",
-            "screen_name": body["screen_name"],
-            "protected": body.get("protected", False),
-        }
 
+def _probe_one(auth_token: str, ct0: str) -> dict:
+    """
+    Stage 1 (authoritative) + Stage 2 (informational).
+
+    Returns a dict with 'status' set to 'ok', 'invalid', or 'error'.
+    On 'ok', 'screen_name' is included if Stage 2 succeeded.
+    """
+    home = _check_home(auth_token, ct0)
+    if home["status"] != "ok":
+        return home
+
+    screen_name = _try_screen_name(auth_token, ct0)
     return {
-        "status": "invalid",
-        "http": resp.status_code,
-        "body": body,
+        "status": "ok",
+        "screen_name": screen_name,  # may be None
     }
 
 
@@ -168,16 +221,13 @@ def main() -> int:
         stats[status] += 1
 
         if status == "ok":
-            lock = " [protected]" if result.get("protected") else ""
-            print(f"  [OK]       {name:20}  ->  @{result['screen_name']}{lock}")
+            sn = result.get("screen_name")
+            handle = f"@{sn}" if sn else "(screen_name unavailable)"
+            print(f"  [OK]       {name:20}  ->  {handle}")
         elif status == "invalid":
             http = result.get("http", "?")
-            body = result.get("body", "?")
-            # Keep the body short so the output stays readable.
-            body_str = str(body)
-            if len(body_str) > 120:
-                body_str = body_str[:117] + "..."
-            print(f"  [INVALID]  {name:20}  http={http} body={body_str}")
+            details = result.get("details", "?")
+            print(f"  [INVALID]  {name:20}  http={http} {details}")
         else:
             print(f"  [ERROR]    {name:20}  {result.get('details')}")
 
