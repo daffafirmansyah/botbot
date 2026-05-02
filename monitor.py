@@ -86,7 +86,7 @@ HOT_WALLET_FLOOR_LAMPORTS = 200_000  # ~0.0002 SOL
 # Log a short "alive" line every N seconds even when nothing interesting is
 # happening. Without this, a quiet hot wallet produces zero log output and
 # the bot looks dead to an outside observer. Set to 0 to disable.
-HEARTBEAT_INTERVAL_SEC = 600  # 10 minutes
+HEARTBEAT_INTERVAL_SEC = 300  # 5 minutes
 
 _stop = False
 
