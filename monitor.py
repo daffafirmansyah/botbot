@@ -23,6 +23,7 @@ Ctrl+C stops cleanly.
 
 from __future__ import annotations
 
+import argparse
 import signal
 import sys
 import threading
@@ -287,18 +288,76 @@ def _process_topup(
         _process_topup_sequential(eligible, state, log)
 
 
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Claimyshare watch-loop auto-withdraw.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  python monitor.py                      # normal run\n"
+            "  python monitor.py --reset-cooldowns    # clear bogus cooldowns on startup\n"
+            "  python monitor.py --no-bootstrap       # skip chain scan on first run\n"
+        ),
+    )
+    p.add_argument(
+        "--reset-cooldowns",
+        action="store_true",
+        help=(
+            "Clear last_success_at and last_attempt_ts for every account on "
+            "startup, then skip the bootstrap chain scan. Use this when "
+            "accounts share a destination wallet and bootstrap assigned the "
+            "same (usually wrong) cooldown to all of them."
+        ),
+    )
+    p.add_argument(
+        "--no-bootstrap",
+        action="store_true",
+        help=(
+            "Skip the bootstrap chain scan even if state.json has no prior "
+            "last_success_at for an account. Useful when the chain scan "
+            "would return a misleading timestamp (shared wallet)."
+        ),
+    )
+    return p.parse_args()
+
+
+def _reset_cooldowns(accounts: list[dict], state: dict, log) -> None:
+    """Clear all per-account cooldown fields. Called by --reset-cooldowns."""
+    cleared = 0
+    for acc in accounts:
+        entry = get_account_state(state, acc["name"])
+        had_success = entry.get("last_success_at") is not None
+        entry["last_success_at"] = None
+        entry["last_attempt_ts"] = 0.0
+        if had_success:
+            cleared += 1
+    save_state(state)
+    log(
+        f"[reset] cleared cooldown for {cleared} of {len(accounts)} account(s). "
+        "All accounts will be eligible on the next top-up."
+    )
+
+
 def main() -> int:
+    args = _parse_args()
     accounts = load_accounts()
     log = make_logger("monitor.log")
     signal.signal(signal.SIGINT, _handle_sigint)
 
     log(
         f"monitor started | accounts={len(accounts)} "
-        f"poll={POLL_INTERVAL_SEC}s topup>={TOPUP_THRESHOLD_LAMPORTS/1e9:.6f} SOL"
+        f"poll={POLL_INTERVAL_SEC}s topup>={TOPUP_THRESHOLD_LAMPORTS/1e9:.6f} SOL "
+        f"reset_cooldowns={args.reset_cooldowns} no_bootstrap={args.no_bootstrap}"
     )
 
     state = load_state()
-    _bootstrap_accounts(accounts, state, log)
+
+    if args.reset_cooldowns:
+        _reset_cooldowns(accounts, state, log)
+        # --reset-cooldowns implies skip-bootstrap (explicit "forget history").
+    elif not args.no_bootstrap:
+        _bootstrap_accounts(accounts, state, log)
+
     _log_startup_status(accounts, state, log)
 
     last_balance = int(state.get("last_hot_balance_lamports", 0))
