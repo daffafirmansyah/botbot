@@ -104,7 +104,9 @@ _ALREADY_DONE_KEYWORDS = (
 )
 _THROTTLED_KEYWORDS = (
     "still verifying",
+    "still syncing",
     "try again later",
+    "try again in a few",
     "too many requests",
 )
 
