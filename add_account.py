@@ -366,6 +366,22 @@ def bulk_import(data: dict, tsv_path: Path) -> int:
     skipped = 0
     for row_num, row in enumerate(reader, start=2):  # row_num counts data rows after header
         taken = existing_names(data)
+
+        # csv.DictReader fills missing columns with None when a data row has
+        # fewer fields than the header (e.g. a cookie paste that swallowed a
+        # TAB, or a newline embedded in a value that broke the row in two).
+        # Detect that up front so we report it clearly instead of crashing on
+        # None.strip().
+        missing_cols = [f for f in REQUIRED_FIELDS if row.get(f) is None]
+        if missing_cols:
+            print(
+                f"  ! row {row_num}: missing column(s) {missing_cols}; "
+                f"this usually means a TAB got lost or a value contained a "
+                f"newline. Skipped."
+            )
+            skipped += 1
+            continue
+
         try:
             entry = {
                 "name": row["name"].strip(),
@@ -374,7 +390,7 @@ def bulk_import(data: dict, tsv_path: Path) -> int:
                 "wallet_address": row["wallet_address"].strip(),
                 "amount_sol": parse_amount(row["amount_sol"]),
             }
-        except (KeyError, ValueError) as e:
+        except (KeyError, ValueError, AttributeError, TypeError) as e:
             print(f"  ! row {row_num}: {e}; skipped.")
             skipped += 1
             continue
