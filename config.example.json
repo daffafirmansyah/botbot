@@ -1,19 +1,19 @@
 {
-  "_comment": "Multi-account schema. For a single account, you can also use the legacy flat schema (bearer_token / cookie / wallet_address / amount_sol at top level) and it'll be auto-wrapped.",
+  "_comment": "Multi-account schema. amount_sol is optional: set to \"auto\" (or omit it) to auto-withdraw the full claimable balance (balanceSolTask from /api/user). Or hard-code a number to always withdraw exactly that. Legacy flat schema is still accepted and auto-wrapped.",
   "accounts": [
     {
       "name": "acc1",
       "bearer_token": "PASTE_JWT_WITHOUT_BEARER_PREFIX",
       "cookie": "GAESA=PASTE_FULL_COOKIE_VALUE_HERE",
       "wallet_address": "YOUR_SOLANA_WALLET_ADDRESS",
-      "amount_sol": 0.0033999998
+      "amount_sol": "auto"
     },
     {
       "name": "acc2",
       "bearer_token": "PASTE_JWT_FOR_ACCOUNT_2",
       "cookie": "GAESA=PASTE_COOKIE_FOR_ACCOUNT_2",
       "wallet_address": "YOUR_SOLANA_WALLET_ADDRESS",
-      "amount_sol": 0.0033999998
+      "amount_sol": "auto"
     }
   ]
 }

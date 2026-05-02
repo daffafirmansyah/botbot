@@ -83,13 +83,42 @@ Fill each account with values pulled from your browser:
 | `bearer_token` | In DevTools → Network → withdraw request → Request Headers → `authorization`. Copy only the part after `Bearer ` (no `Bearer ` prefix). Token expires ~30 days after issuance. |
 | `cookie` | Same Network request → Request Headers → `cookie`. Copy the **entire** value (e.g. `GAESA=...`). |
 | `wallet_address` | Solana wallet where withdrawals should land. |
-| `amount_sol` | Amount the UI lets you withdraw. The UI currently posts e.g. `0.0033999998`. |
+| `amount_sol` | Either a number (e.g. `0.0033999998` — always withdraw exactly that) **or** the string `"auto"` (or omit the field entirely) — the bot will call `GET /api/user`, read `balanceSolTask`, and withdraw whatever is claimable at that moment. Recommended for multi-account since each account accumulates different amounts. |
 
 There is no shortcut for multi-account: you must extract
 `bearer_token` + `cookie` from each account's logged-in browser session
 separately. Twitter / OAuth auto-login is **not** supported by design.
 
 `config.json` is gitignored — don't commit it.
+
+### Auto-withdraw full claimable balance
+
+Set `amount_sol` to `"auto"` (the default for new accounts added via
+`add_account.py`). When the bot decides to fire a withdraw for that
+account, it does:
+
+1. `GET https://claimyshare.io/api/user` using the account's bearer +
+   cookie.
+2. Read the `balanceSolTask` field from the JSON response.
+3. If it's **≥ `MIN_WITHDRAW_SOL`** (default `0.0005` SOL — tunable near
+   the top of `core.py`), POST `/api/withdraw` with exactly that amount.
+4. Otherwise log a `[skip]` line and move on.
+
+Log excerpt:
+
+```
+[acc1] [auto] claimable balance = 0.004500000 SOL; withdrawing that.
+[acc2] [skip] claimable balance 0.000000000 SOL below threshold 0.0005 SOL; nothing to withdraw.
+[acc5] [auto] claimable balance = 0.012800000 SOL; withdrawing that.
+```
+
+The extra `/api/user` GET happens inside each worker thread, so for
+parallel mode the total latency per account is roughly
+`GET + POST ≈ 0.5–1 s`. 50 accounts in parallel still finish in a
+couple seconds.
+
+If you need the old static-amount behavior (e.g. for debugging), just
+put a number in `amount_sol` instead of `"auto"`.
 
 ### Adding many accounts (helper)
 
@@ -119,9 +148,13 @@ python add_account.py --bulk accounts.tsv
 
 ```
 name	bearer_token	cookie	wallet_address	amount_sol
-acc1	eyJhbG...	GAESA=...	24Kgco...	0.0033999998
-acc2	eyJhbG...	GAESA=...	24Kgco...	0.0033999998
+acc1	eyJhbG...	GAESA=...	24Kgco...	auto
+acc2	eyJhbG...	GAESA=...	24Kgco...	auto
+acc3	eyJhbG...	GAESA=...	24Kgco...	0.0033999998
 ```
+
+`amount_sol` accepts either `auto` (recommended — withdraw whatever is
+currently claimable) or a specific number (always withdraw exactly that).
 
 Build the file from your password manager / spreadsheet of extracted
 credentials. Existing accounts are preserved; duplicates by `name`

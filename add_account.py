@@ -104,11 +104,18 @@ def normalize_bearer(raw: str) -> str:
     return s
 
 
-def parse_amount(raw: str) -> float:
+def parse_amount(raw: str):
+    """Return float for a positive number, the string "auto" for the
+    auto-balance sentinel, or raise ValueError."""
     raw = raw.strip()
     if not raw:
-        raise ValueError("empty amount")
-    return float(raw)
+        return "auto"
+    if raw.lower() == "auto":
+        return "auto"
+    v = float(raw)
+    if v <= 0:
+        raise ValueError("amount must be > 0 (or \"auto\")")
+    return v
 
 
 def validate_entry(entry: dict, taken_names: set[str]) -> Optional[str]:
@@ -119,8 +126,12 @@ def validate_entry(entry: dict, taken_names: set[str]) -> Optional[str]:
             return f"missing field {f!r}"
     if entry["name"] in taken_names:
         return f"duplicate name {entry['name']!r}"
-    if not isinstance(entry["amount_sol"], (int, float)) or entry["amount_sol"] <= 0:
-        return f"invalid amount_sol: {entry['amount_sol']!r}"
+    amt = entry["amount_sol"]
+    if isinstance(amt, str):
+        if amt.strip().lower() != "auto":
+            return f"invalid amount_sol: {amt!r} (use a number or \"auto\")"
+    elif not isinstance(amt, (int, float)) or amt <= 0:
+        return f"invalid amount_sol: {amt!r}"
     return None
 
 
@@ -156,7 +167,8 @@ def interactive_loop(data: dict) -> int:
     if data["accounts"]:
         last = data["accounts"][-1]
         last_wallet = last.get("wallet_address")
-        last_amount = str(last.get("amount_sol")) if last.get("amount_sol") is not None else None
+        amt = last.get("amount_sol")
+        last_amount = str(amt) if amt is not None else None
 
     added = 0
     try:
@@ -170,7 +182,10 @@ def interactive_loop(data: dict) -> int:
             bearer = normalize_bearer(_prompt("bearer (paste JWT, no 'Bearer ' prefix needed)"))
             cookie = _prompt("cookie (paste full value e.g. GAESA=...)")
             wallet = _prompt("wallet_address (Solana)", default=last_wallet)
-            amount_str = _prompt("amount_sol", default=last_amount or "0.0033999998")
+            amount_str = _prompt(
+                "amount_sol ('auto' = withdraw full claimable balance)",
+                default=last_amount or "auto",
+            )
 
             try:
                 amount = parse_amount(amount_str)

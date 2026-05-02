@@ -22,6 +22,7 @@ import requests
 # ---------------------------------------------------------------------------
 
 API_URL = "https://claimyshare.io/api/withdraw"
+USER_API_URL = "https://claimyshare.io/api/user"
 SOLANA_RPC = "https://solana-rpc.publicnode.com"
 HOT_WALLET = "8MrX8pJ6VkCsmMjrn4jTrp9DFACrytKVz6T23vDpqGgy"
 
@@ -42,6 +43,11 @@ RATE_LIMIT_MAX_REQS = 3
 # Daily cooldown between successful withdraws — use slightly under 24h so we
 # don't miss the earliest valid slot.
 DAILY_COOLDOWN_SEC = 23 * 3600 + 55 * 60  # 23h55m
+
+# Auto-withdraw mode: skip withdraws for accounts whose claimable balance
+# (balanceSolTask from /api/user) is below this. Prevents burning rate-limit
+# budget on dust or on accounts already drained in the current cycle.
+MIN_WITHDRAW_SOL = 0.0005
 
 Logger = Callable[[str], None]
 
@@ -80,7 +86,54 @@ def make_logger(log_filename: str) -> Logger:
 # Config
 # ---------------------------------------------------------------------------
 
-REQUIRED_ACCOUNT_FIELDS = ("bearer_token", "cookie", "wallet_address", "amount_sol")
+# amount_sol is intentionally NOT here: it's optional (default "auto" => fetch
+# balanceSolTask from /api/user at withdraw time). Validated separately in
+# load_accounts().
+REQUIRED_ACCOUNT_FIELDS = ("bearer_token", "cookie", "wallet_address")
+
+
+def _normalize_amount_sol(raw, acc_name: str):
+    """
+    Accepts:
+      - missing / None / "" / "auto" (any case) -> returns "auto" sentinel
+      - positive int or float -> returns float
+    Anything else aborts via sys.exit(EXIT_CONFIG).
+    """
+    if raw is None:
+        return "auto"
+    if isinstance(raw, str):
+        s = raw.strip().lower()
+        if s in ("", "auto"):
+            return "auto"
+        # Allow numeric string like "0.0034" for convenience (e.g. imported TSV).
+        try:
+            v = float(s)
+        except ValueError:
+            print(
+                f"[error] account {acc_name!r}: amount_sol={raw!r} is not "
+                f"a number or \"auto\".",
+                file=sys.stderr,
+            )
+            sys.exit(EXIT_CONFIG)
+        if v <= 0:
+            print(
+                f"[error] account {acc_name!r}: amount_sol must be > 0 "
+                f"(got {v}).",
+                file=sys.stderr,
+            )
+            sys.exit(EXIT_CONFIG)
+        return v
+    if isinstance(raw, (int, float)):
+        if raw <= 0:
+            # 0 / negative is treated as "auto" intent for convenience.
+            return "auto"
+        return float(raw)
+    print(
+        f"[error] account {acc_name!r}: amount_sol has unsupported type "
+        f"{type(raw).__name__}.",
+        file=sys.stderr,
+    )
+    sys.exit(EXIT_CONFIG)
 
 
 def _read_config_file() -> dict:
@@ -130,6 +183,7 @@ def load_accounts() -> list[dict]:
             sys.exit(EXIT_CONFIG)
         acc = dict(data)
         acc["name"] = acc.get("name") or "default"
+        acc["amount_sol"] = _normalize_amount_sol(acc.get("amount_sol"), acc["name"])
         return [acc]
 
     # Multi-account.
@@ -166,6 +220,7 @@ def load_accounts() -> list[dict]:
 
         cleaned = dict(acc)
         cleaned["name"] = name
+        cleaned["amount_sol"] = _normalize_amount_sol(acc.get("amount_sol"), name)
         normalized.append(cleaned)
 
     return normalized
@@ -377,6 +432,51 @@ def is_cooldown_message(parsed: dict | None) -> bool:
     return "too many withdrawal" in msg
 
 
+def fetch_claimable_balance(cfg: dict, log: Logger) -> float | None:
+    """
+    GET /api/user with this account's credentials and return the
+    `balanceSolTask` field as a float (SOL).
+
+    Returns None on any failure (network, non-200, non-JSON, missing or
+    non-numeric field). Callers should treat None as "cannot proceed".
+    """
+    name = cfg.get("name", "?")
+    headers = build_headers(cfg["bearer_token"], cfg["cookie"])
+    # Balance fetch is a read from the app root, not the /withdraw page.
+    headers["referer"] = "https://claimyshare.io/"
+
+    try:
+        resp = requests.get(USER_API_URL, headers=headers, timeout=15)
+    except requests.RequestException as e:
+        log(f"[{name}] [balance] network error: {e}")
+        return None
+
+    if resp.status_code != 200:
+        log(f"[{name}] [balance] unexpected status {resp.status_code}.")
+        return None
+
+    try:
+        parsed = resp.json()
+    except ValueError:
+        log(f"[{name}] [balance] non-JSON response.")
+        return None
+
+    if not isinstance(parsed, dict):
+        log(f"[{name}] [balance] response body is not a JSON object.")
+        return None
+
+    val = parsed.get("balanceSolTask")
+    if val is None:
+        log(f"[{name}] [balance] 'balanceSolTask' missing in /api/user response.")
+        return None
+
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        log(f"[{name}] [balance] 'balanceSolTask' not numeric: {val!r}.")
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Core withdraw attempt
 # ---------------------------------------------------------------------------
@@ -390,7 +490,10 @@ def attempt_withdraw(
     Send exactly one POST to /api/withdraw for a single account config.
 
     Args:
-        cfg: account dict with bearer_token, cookie, wallet_address, amount_sol.
+        cfg: account dict with bearer_token, cookie, wallet_address.
+             amount_sol is optional:
+               - "auto" (or missing) -> GET /api/user, withdraw balanceSolTask.
+               - positive number -> withdraw exactly that.
              Optional "name" field is used purely for log context.
         log: logger callable.
         verify_onchain: if True (default), sleep 30s after a 2xx success and
@@ -400,8 +503,25 @@ def attempt_withdraw(
     Returns (exit_code, parsed_body_or_none, http_status_or_0).
     """
     wallet = cfg["wallet_address"]
-    amount = float(cfg["amount_sol"])
     name = cfg.get("name", "?")
+
+    # Resolve the amount: "auto" => fetch balanceSolTask from /api/user.
+    raw_amount = cfg.get("amount_sol", "auto")
+    if isinstance(raw_amount, str) and raw_amount.strip().lower() == "auto":
+        balance = fetch_claimable_balance(cfg, log)
+        if balance is None:
+            log(f"[{name}] [error] could not fetch claimable balance; skipping.")
+            return EXIT_API_ERROR, None, 0
+        if balance < MIN_WITHDRAW_SOL:
+            log(
+                f"[{name}] [skip] claimable balance {balance:.9f} SOL "
+                f"below threshold {MIN_WITHDRAW_SOL} SOL; nothing to withdraw."
+            )
+            return EXIT_COOLDOWN, None, 0
+        amount = balance
+        log(f"[{name}] [auto] claimable balance = {amount:.9f} SOL; withdrawing that.")
+    else:
+        amount = float(raw_amount)
 
     pre: int | None = None
     if verify_onchain:
