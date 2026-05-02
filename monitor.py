@@ -65,7 +65,7 @@ PER_ACCOUNT_SPACING_SEC = 5
 # them. Drastically increases hit rate when hot wallet drains fast.
 # Trade-off: makes the burst pattern from one IP more visible to WAF.
 PARALLEL_FIRE = True
-MAX_PARALLEL_WORKERS = 20            # cap concurrent in-flight POSTs
+MAX_PARALLEL_WORKERS = 32            # cap concurrent in-flight POSTs
 # Stagger the parallel dispatch so account #N waits N * PARALLEL_STAGGER_MS
 # before its first request fires. 0 = pure burst (all reqs in same ms,
 # maximum sniping speed but high 429-storm risk — relies on aggressive retry
