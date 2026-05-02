@@ -19,7 +19,8 @@ Two modes:
       python add_account.py --remove acc1
       python add_account.py --remove acc1,acc2,acc5
       python add_account.py --remove 3,7        # by --list index
-      python add_account.py --remove acc1 --yes  # skip confirmation
+      python add_account.py --remove all        # wipe every account
+      python add_account.py --remove all --yes  # wipe without confirmation
 
 Bulk file format (header row required, any column order):
 
@@ -286,22 +287,26 @@ def remove_accounts(data: dict, spec: str, skip_confirm: bool) -> int:
         print("[error] --remove value is empty.")
         return 1
 
-    # Resolve each target (name or 1-based index from --list) to an account name.
+    # Resolve each target (name, 1-based index from --list, or "all") to an account name.
     to_remove: set[str] = set()
     not_found: list[str] = []
     name_set = {a.get("name") for a in accounts}
 
-    for t in targets:
-        if t.isdigit():
-            idx = int(t)
-            if 1 <= idx <= len(accounts):
-                to_remove.add(accounts[idx - 1]["name"])
+    # Special token: "all" wipes every account.
+    if any(t.lower() == "all" for t in targets):
+        to_remove = {a.get("name") for a in accounts if a.get("name")}
+    else:
+        for t in targets:
+            if t.isdigit():
+                idx = int(t)
+                if 1 <= idx <= len(accounts):
+                    to_remove.add(accounts[idx - 1]["name"])
+                else:
+                    not_found.append(f"index {t} (valid: 1..{len(accounts)})")
+            elif t in name_set:
+                to_remove.add(t)
             else:
-                not_found.append(f"index {t} (valid: 1..{len(accounts)})")
-        elif t in name_set:
-            to_remove.add(t)
-        else:
-            not_found.append(f"name {t!r}")
+                not_found.append(f"name {t!r}")
 
     if not_found:
         print(f"[error] not found: {', '.join(not_found)}")
