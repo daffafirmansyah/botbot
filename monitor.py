@@ -64,11 +64,12 @@ PER_ACCOUNT_SPACING_SEC = RATE_LIMIT_WINDOW_SEC // 2 + 5  # ~35s
 PARALLEL_FIRE = True
 MAX_PARALLEL_WORKERS = 20            # cap concurrent in-flight POSTs
 # Stagger the parallel dispatch so account #N waits N * PARALLEL_STAGGER_MS
-# before its first request fires. Smooths a 50-acct burst into ~5 req/sec
-# from one IP so Cloudflare/WAF anti-abuse doesn't see DDoS-shaped traffic.
-# 50 accts * 200ms = 10s dispatch window — still well within a 5-15 min topup.
-# Set 0 to disable (pure burst).
-PARALLEL_STAGGER_MS = 200
+# before its first request fires. 2000 = ~1 req every 2 seconds from one IP
+# — looks like a human clicking 'withdraw' on each tab, almost never trips
+# a per-IP rate-limit (Cloudflare / claimyshare WAF). 50 accts * 2s = 100s
+# dispatch window, still inside a typical 5-15 min topup. Lower if you have
+# few accounts and want speed; raise if 429-storm persists.
+PARALLEL_STAGGER_MS = 2000
 
 # Sequential fallback (only used if PARALLEL_FIRE = False):
 INTER_ACCOUNT_SPACING_SEC = 5
