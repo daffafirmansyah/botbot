@@ -40,8 +40,8 @@ USER_API_URL = "https://claimyshare.io/api/user"
 #     "https://mainnet.helius-rpc.com/?api-key=YOUR_KEY",
 #     "https://solana-mainnet.g.alchemy.com/v2/YOUR_KEY",
 SOLANA_RPCS = [
-    "https://solana-rpc.publicnode.com",     # PublicNode (anycast, generous)
-    "https://api.mainnet-beta.solana.com",   # Solana Labs official fallback
+    "https://api.mainnet-beta.solana.com",   # Solana Labs official (primary)
+    "https://solana-rpc.publicnode.com",     # PublicNode (anycast) fallback
 ]
 # Backward-compat alias: some code may still reference SOLANA_RPC.
 SOLANA_RPC = SOLANA_RPCS[0]
