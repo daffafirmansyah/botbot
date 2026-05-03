@@ -52,7 +52,7 @@ from core import (
 # Tunables
 # ---------------------------------------------------------------------------
 
-POLL_INTERVAL_SEC = 15                   # how often we check the hot wallet balance
+POLL_INTERVAL_SEC = 10                   # how often we check the hot wallet balance
 TOPUP_THRESHOLD_LAMPORTS = 100_000_000   # 0.1 SOL — only fire on real admin refills
 # Per-account spacing between attempts from the SAME account across different
 # topup events. Aligned with withdraw.py's INTER_ACCOUNT_SPACING_SEC (5s);
