@@ -25,7 +25,27 @@ import requests
 
 API_URL = "https://claimyshare.io/api/withdraw"
 USER_API_URL = "https://claimyshare.io/api/user"
-SOLANA_RPC = "https://solana-rpc.publicnode.com"
+
+# Solana RPC endpoints, tried in order. First success wins; the last-known-good
+# endpoint is remembered and preferred on subsequent calls, so a transient
+# outage on the primary doesn't add latency to every poll afterwards.
+#
+# Only free, no-API-key endpoints that were verified live are listed here.
+# Many older public endpoints (Ankr, drpc.org, onfinality, extrnode, rpcpool,
+# helius) now require signup + key, rate-limit aggressively on the anonymous
+# tier, or return 401/403 — do NOT re-add them without testing.
+#
+# To add a private endpoint with an API key (recommended if you run the bot
+# 24/7), just append its URL to the list, e.g.:
+#     "https://mainnet.helius-rpc.com/?api-key=YOUR_KEY",
+#     "https://solana-mainnet.g.alchemy.com/v2/YOUR_KEY",
+SOLANA_RPCS = [
+    "https://solana-rpc.publicnode.com",     # PublicNode (anycast, generous)
+    "https://api.mainnet-beta.solana.com",   # Solana Labs official fallback
+]
+# Backward-compat alias: some code may still reference SOLANA_RPC.
+SOLANA_RPC = SOLANA_RPCS[0]
+
 HOT_WALLET = "8MrX8pJ6VkCsmMjrn4jTrp9DFACrytKVz6T23vDpqGgy"
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -262,14 +282,43 @@ def load_config() -> dict:
 # Solana RPC helpers
 # ---------------------------------------------------------------------------
 
-def _rpc(method: str, params: list, timeout: int = 15) -> dict | None:
+# Index of the RPC endpoint that last succeeded. Used so that after a
+# fallover we stick with the working endpoint instead of hitting the dead
+# primary on every subsequent poll. Reset to 0 on process restart.
+_last_good_rpc_idx = 0
+
+
+def _rpc(method: str, params: list, timeout: int = 10) -> dict | None:
+    """
+    Call a Solana JSON-RPC method with automatic fallover across
+    SOLANA_RPCS. Returns the parsed response on first success, or None
+    if every endpoint fails / times out.
+
+    Starts from the last-known-good endpoint to avoid wasting time on a
+    primary that's currently down, then round-robins through the rest.
+    """
+    global _last_good_rpc_idx
     payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
-    try:
-        r = requests.post(SOLANA_RPC, json=payload, timeout=timeout)
-        r.raise_for_status()
-        return r.json()
-    except Exception:
+    n = len(SOLANA_RPCS)
+    if n == 0:
         return None
+    # Try last-known-good first, then the rest in order.
+    order = [(_last_good_rpc_idx + i) % n for i in range(n)]
+    for idx in order:
+        url = SOLANA_RPCS[idx]
+        try:
+            r = requests.post(url, json=payload, timeout=timeout)
+            r.raise_for_status()
+            data = r.json()
+            # Solana RPC returns HTTP 200 even for JSON-RPC errors, so
+            # guard against {"error": ...} responses before declaring victory.
+            if isinstance(data, dict) and "error" in data and "result" not in data:
+                continue
+            _last_good_rpc_idx = idx
+            return data
+        except Exception:
+            continue
+    return None
 
 
 def get_balance_lamports(address: str) -> int | None:
