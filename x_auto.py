@@ -1,5 +1,6 @@
 """
-x_auto.py — Phase 2: auto follow/like on X based on pending_x.json.
+x_auto.py — Phase 2 (+ optional Phase 3): auto follow/like on X, optionally
+claim the reward immediately after.
 
 Pipeline:
   1. tasks.py (Phase 1) writes pending_x.json with rows like:
@@ -11,14 +12,21 @@ Pipeline:
        - follow -> POST /1.1/friendships/create.json screen_name=<handle>
        - like   -> POST /1.1/favorites/create.json    id=<tweet_id>
        - random 30-90s delay between actions per account (anti-bot)
-  4. Successful entries are removed from pending_x.json. Failed entries are
-     kept so the next run can retry. Re-run tasks.py afterwards to claim
-     the rewards now that the X side is satisfied.
+  4. (OPTIONAL, --auto-claim) After each successful X action, wait
+     --claim-delay seconds for X to propagate, then POST to
+     /api/tasks/complete on claimyshare to credit the reward. Retries on
+     "still verifying" / "not following yet" responses.
+  5. Successful entries are removed from pending_x.json. Failed entries are
+     kept so the next run can retry. Without --auto-claim you still need
+     to re-run tasks.py to claim; with --auto-claim the reward is already
+     credited and tasks.py only needs to run again if new tasks appeared.
 
 Examples:
-  python x_auto.py                    # process all accounts in pending_x.json
-  python x_auto.py --name qolvex21    # only one account
-  python x_auto.py --dry-run          # preview, don't POST anything
+  python x_auto.py                                 # follow/like only, manual claim later
+  python x_auto.py --auto-claim                    # full pipeline (Phase 2 + 3)
+  python x_auto.py --auto-claim --claim-delay 25   # longer wait for X propagation
+  python x_auto.py --name qolvex21 --auto-claim    # one account, full pipeline
+  python x_auto.py --dry-run                       # preview, don't POST anything
 
 Outputs:
   x_auto.log          human-readable log
@@ -41,7 +49,18 @@ from pathlib import Path
 
 import requests
 
-from core import EXIT_API_ERROR, EXIT_OK, SCRIPT_DIR, make_logger
+from core import (
+    EXIT_API_ERROR,
+    EXIT_OK,
+    SCRIPT_DIR,
+    load_accounts,
+    make_logger,
+)
+# Re-used claim helpers. These are module-level in tasks.py; importing them
+# here instead of duplicating keeps the two phases in lockstep if the API
+# classification changes. The underscore prefix is cosmetic — they're safe to
+# call externally (pure functions, no tasks.py CLI state).
+from tasks import _classify_response, complete_task
 
 # ---------------------------------------------------------------------------
 # Files
@@ -82,6 +101,17 @@ ACCOUNT_DELAY_MIN_SEC = 5
 ACCOUNT_DELAY_MAX_SEC = 12
 
 HTTP_TIMEOUT_SEC = 20
+
+# --- Auto-claim (Phase 3) tunables ---
+# When --auto-claim is passed, after every successful X action we wait this
+# long to let X propagate the follow/like to its backend, then POST to
+# /api/tasks/complete on claimyshare. Too short -> server will still say
+# "not following this account yet" and we have to retry on next run.
+AUTO_CLAIM_DELAY_SEC_DEFAULT = 15
+# If the first claim attempt says "still verifying" / "try again later",
+# wait this much longer and retry, up to AUTO_CLAIM_MAX_RETRIES times.
+AUTO_CLAIM_RETRY_BACKOFF_SEC = 15
+AUTO_CLAIM_MAX_RETRIES = 2
 
 # X error codes that mean "the action is already done" — treat as success.
 ALREADY_FOLLOWING_CODES = {160, 158}   # 160 = already requested, 158 = already following
@@ -222,6 +252,103 @@ def perform_like(auth_token: str, ct0: str, tweet_id: str) -> tuple[str, dict]:
 # ---------------------------------------------------------------------------
 
 
+def load_claimyshare_creds() -> dict[str, dict]:
+    """
+    Return {name: {"bearer": ..., "cookie": ...}} for accounts in config.json
+    that have a filled bearer and cookie. Used by --auto-claim to call
+    /api/tasks/complete after an X action succeeds.
+
+    Never raises: returns an empty dict if config.json is missing or
+    malformed (BaseException catches core.load_accounts()'s sys.exit too).
+    """
+    out: dict[str, dict] = {}
+    try:
+        accounts = load_accounts()
+    except BaseException:
+        return out
+    for acc in accounts:
+        name = acc.get("name")
+        bearer = acc.get("bearer_token") or acc.get("bearer") or ""
+        cookie = acc.get("cookie") or ""
+        if name and bearer and cookie:
+            out[name] = {"bearer": bearer, "cookie": cookie}
+    return out
+
+
+def try_auto_claim(
+    name: str,
+    task_id: int,
+    bearer: str,
+    cookie: str,
+    initial_delay_sec: int,
+    log,
+) -> str:
+    """
+    After a successful X action, wait for X to propagate, then call
+    claimyshare's /api/tasks/complete. Retries with backoff on "throttled"
+    (still-verifying) responses.
+
+    Returns the final claim outcome string:
+      "ok"           -> reward credited
+      "already-done" -> server says already claimed
+      "need-follow"  -> server still doesn't see our follow (keep action pending)
+      "need-like"    -> server still doesn't see our like  (keep action pending)
+      "throttled"    -> gave up after max retries
+      "error"        -> HTTP / network / unknown response
+      "skip"         -> missing task_id, nothing to claim
+    """
+    if not task_id:
+        log(f"[{name}] [auto-claim] no task_id on action, skipping claim.")
+        return "skip"
+
+    delay = max(1, int(initial_delay_sec))
+    log(f"[{name}] [auto-claim] waiting {delay}s for X propagation, then claim task {task_id}...")
+    time.sleep(delay)
+
+    for attempt in range(1, AUTO_CLAIM_MAX_RETRIES + 2):  # +1 initial + retries
+        status, body = complete_task(bearer, cookie, task_id)
+        outcome = _classify_response(status, body)
+
+        if outcome == "ok":
+            msg = ""
+            if isinstance(body, dict):
+                msg = str(body.get("message") or "")
+            log(f"[{name}] [auto-claim] [ok] task {task_id} claimed ({msg or 'reward credited'}).")
+            return "ok"
+        if outcome == "already-done":
+            log(f"[{name}] [auto-claim] [already-done] task {task_id}.")
+            return "already-done"
+        if outcome in ("need-follow", "need-like"):
+            # X action hasn't propagated yet. One more retry with backoff.
+            if attempt <= AUTO_CLAIM_MAX_RETRIES:
+                backoff = AUTO_CLAIM_RETRY_BACKOFF_SEC
+                log(
+                    f"[{name}] [auto-claim] server says '{outcome}' on task "
+                    f"{task_id}; waiting {backoff}s and retrying "
+                    f"(attempt {attempt}/{AUTO_CLAIM_MAX_RETRIES})..."
+                )
+                time.sleep(backoff)
+                continue
+            log(f"[{name}] [auto-claim] gave up on task {task_id} after "
+                f"{attempt} attempt(s) — server still reports '{outcome}'. "
+                "Keeping action pending for next run.")
+            return outcome
+        if outcome == "throttled":
+            if attempt <= AUTO_CLAIM_MAX_RETRIES:
+                backoff = AUTO_CLAIM_RETRY_BACKOFF_SEC
+                log(f"[{name}] [auto-claim] throttled; waiting {backoff}s "
+                    f"(attempt {attempt}/{AUTO_CLAIM_MAX_RETRIES})...")
+                time.sleep(backoff)
+                continue
+            log(f"[{name}] [auto-claim] throttled, giving up on task {task_id}.")
+            return "throttled"
+        # error / unknown
+        log(f"[{name}] [auto-claim] [error] task {task_id}: status={status} body={body}")
+        return "error"
+
+    return "error"
+
+
 def load_x_accounts() -> dict[str, dict]:
     """Return {name: {"auth_token": ..., "ct0": ...}} for filled rows."""
     if not X_ACCOUNTS_PATH.exists():
@@ -300,9 +427,17 @@ def process_account(
     creds: dict,
     log,
     dry_run: bool,
+    auto_claim: bool = False,
+    claim_creds: dict | None = None,
+    claim_delay_sec: int = AUTO_CLAIM_DELAY_SEC_DEFAULT,
 ) -> tuple[list[dict], dict]:
     """
     Walk one account's pending actions, executing each one.
+
+    When auto_claim is True AND claim_creds has bearer+cookie, after each
+    successful X action we additionally POST /api/tasks/complete to claim
+    the reward. Actions whose claim still says "need-follow"/"need-like"
+    are kept in the pending list so the next run can retry.
 
     Returns (still_pending_for_this_account, stats).
     """
@@ -311,7 +446,8 @@ def process_account(
 
     still_pending: list[dict] = []
     stats = {"ok": 0, "already": 0, "invalid": 0, "auth": 0,
-             "rate_limit": 0, "error": 0}
+             "rate_limit": 0, "error": 0,
+             "claim_ok": 0, "claim_fail": 0, "claim_skip": 0}
 
     for i, action in enumerate(actions):
         kind = action.get("action")
@@ -334,6 +470,9 @@ def process_account(
             outcome, debug = perform_like(auth_token, ct0, target)
         else:
             outcome, debug = "invalid", {"reason": f"unknown action {kind!r}"}
+
+        # Track whether the X action succeeded (real success or already-done).
+        x_succeeded = outcome in ("ok", "already")
 
         if outcome == "ok":
             stats["ok"] += 1
@@ -369,6 +508,34 @@ def process_account(
             log(f"[{name}] [error] {kind} {target} {debug} — keeping for retry.")
             still_pending.append(action)
 
+        # --- Optional: immediately claim the reward on claimyshare ---
+        if x_succeeded and auto_claim and not dry_run:
+            if not claim_creds or not claim_creds.get("bearer"):
+                log(f"[{name}] [auto-claim] no claimyshare creds for this "
+                    "account; skipping claim.")
+                stats["claim_skip"] += 1
+            else:
+                claim_outcome = try_auto_claim(
+                    name=name,
+                    task_id=task_id,
+                    bearer=claim_creds["bearer"],
+                    cookie=claim_creds["cookie"],
+                    initial_delay_sec=claim_delay_sec,
+                    log=log,
+                )
+                if claim_outcome in ("ok", "already-done"):
+                    stats["claim_ok"] += 1
+                elif claim_outcome == "skip":
+                    stats["claim_skip"] += 1
+                else:
+                    # need-follow/need-like/throttled/error: X action was
+                    # real but claim didn't stick. Put action back in
+                    # pending so the next run can retry the claim (no need
+                    # to redo the X side — it's already done).
+                    stats["claim_fail"] += 1
+                    if action not in still_pending:
+                        still_pending.append(action)
+
     return still_pending, stats
 
 
@@ -379,7 +546,17 @@ def process_account(
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Auto-execute pending_x.json (follow/like) on X."
+        description="Auto-execute pending_x.json (follow/like) on X, "
+                    "optionally claiming the reward right after.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  python x_auto.py                                      # Phase 2 only: follow/like\n"
+            "  python x_auto.py --auto-claim                         # Phase 2 + Phase 3: claim reward too\n"
+            "  python x_auto.py --auto-claim --claim-delay 20        # wait 20s before claim\n"
+            "  python x_auto.py --name qolvex21 --auto-claim         # one account, full pipeline\n"
+            "  python x_auto.py --dry-run                            # preview only\n"
+        ),
     )
     p.add_argument(
         "--name",
@@ -389,6 +566,25 @@ def _parse_args() -> argparse.Namespace:
         "--dry-run",
         action="store_true",
         help="preview actions without POSTing to X.",
+    )
+    p.add_argument(
+        "--auto-claim",
+        action="store_true",
+        help=(
+            "after each successful X action, wait --claim-delay seconds, then "
+            "POST /api/tasks/complete on claimyshare to credit the reward. "
+            "Requires bearer+cookie in config.json for each account."
+        ),
+    )
+    p.add_argument(
+        "--claim-delay",
+        type=int,
+        default=AUTO_CLAIM_DELAY_SEC_DEFAULT,
+        help=(
+            f"seconds to wait between X action and claim (default "
+            f"{AUTO_CLAIM_DELAY_SEC_DEFAULT}). Too short = server still "
+            "says 'not following yet' and we have to retry."
+        ),
     )
     return p.parse_args()
 
@@ -401,6 +597,11 @@ def main() -> int:
     accounts_pending: dict[str, list] = pending.get("accounts") or {}
 
     x_creds = load_x_accounts()
+    claim_creds_all = load_claimyshare_creds() if args.auto_claim else {}
+
+    if args.auto_claim and not claim_creds_all:
+        log("[warn] --auto-claim requested but no accounts in config.json have "
+            "both bearer and cookie filled. Claim step will be skipped for all.")
 
     if args.name:
         if args.name not in accounts_pending:
@@ -413,11 +614,14 @@ def main() -> int:
 
     log(
         f"x_auto start | accounts_pending={list(accounts_pending.keys())} "
-        f"x_accounts_filled={len(x_creds)} dry_run={args.dry_run}"
+        f"x_accounts_filled={len(x_creds)} "
+        f"auto_claim={args.auto_claim} claim_delay={args.claim_delay}s "
+        f"dry_run={args.dry_run}"
     )
 
     grand_stats = {"ok": 0, "already": 0, "invalid": 0, "auth": 0,
-                   "rate_limit": 0, "error": 0}
+                   "rate_limit": 0, "error": 0,
+                   "claim_ok": 0, "claim_fail": 0, "claim_skip": 0}
     remaining: dict[str, list] = {}
 
     account_names = list(accounts_pending.keys())
@@ -439,7 +643,16 @@ def main() -> int:
             log(f"[{name}] sleeping {sleep_s:.1f}s before account starts...")
             time.sleep(sleep_s)
 
-        still_pending, stats = process_account(name, actions, creds, log, args.dry_run)
+        still_pending, stats = process_account(
+            name,
+            actions,
+            creds,
+            log,
+            args.dry_run,
+            auto_claim=args.auto_claim,
+            claim_creds=claim_creds_all.get(name),
+            claim_delay_sec=args.claim_delay,
+        )
 
         for k, v in stats.items():
             grand_stats[k] += v
@@ -450,10 +663,16 @@ def main() -> int:
     # Summary
     log("=== summary ===")
     log(
-        f"  ok={grand_stats['ok']} already={grand_stats['already']} "
+        f"  X: ok={grand_stats['ok']} already={grand_stats['already']} "
         f"invalid-target={grand_stats['invalid']} auth-fail={grand_stats['auth']} "
         f"rate-limit={grand_stats['rate_limit']} error={grand_stats['error']}"
     )
+    if args.auto_claim:
+        log(
+            f"  claim: ok={grand_stats['claim_ok']} "
+            f"fail={grand_stats['claim_fail']} "
+            f"skip={grand_stats['claim_skip']}"
+        )
 
     # Update pending_x.json (don't touch in dry-run mode)
     if not args.dry_run:
