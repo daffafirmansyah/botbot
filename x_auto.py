@@ -1,6 +1,6 @@
 """
-x_auto.py — Phase 2 (+ optional Phase 3): auto follow/like on X, optionally
-claim the reward immediately after.
+x_auto.py — Phase 2 + Phase 3 in one shot: follow/like on X, then
+immediately claim the reward on claimyshare.
 
 Pipeline:
   1. tasks.py (Phase 1) writes pending_x.json with rows like:
@@ -12,21 +12,23 @@ Pipeline:
        - follow -> POST /1.1/friendships/create.json screen_name=<handle>
        - like   -> POST /1.1/favorites/create.json    id=<tweet_id>
        - random 30-90s delay between actions per account (anti-bot)
-  4. (OPTIONAL, --auto-claim) After each successful X action, wait
-     --claim-delay seconds for X to propagate, then POST to
-     /api/tasks/complete on claimyshare to credit the reward. Retries on
-     "still verifying" / "not following yet" responses.
-  5. Successful entries are removed from pending_x.json. Failed entries are
-     kept so the next run can retry. Without --auto-claim you still need
-     to re-run tasks.py to claim; with --auto-claim the reward is already
-     credited and tasks.py only needs to run again if new tasks appeared.
+  4. After each successful X action, wait --claim-delay seconds for X to
+     propagate, then POST /api/tasks/complete on claimyshare to credit the
+     reward. Retries on "still verifying" / "not following yet" responses.
+  5. Successful entries are removed from pending_x.json. Failed entries
+     (X action failed OR claim kept failing) are kept so the next run can
+     retry.
+
+Use --skip-claim to run Phase 2 only (legacy behavior): do the X action but
+do not call claimyshare afterwards. You'd then have to run tasks.py
+separately to credit the reward.
 
 Examples:
-  python x_auto.py                                 # follow/like only, manual claim later
-  python x_auto.py --auto-claim                    # full pipeline (Phase 2 + 3)
-  python x_auto.py --auto-claim --claim-delay 25   # longer wait for X propagation
-  python x_auto.py --name qolvex21 --auto-claim    # one account, full pipeline
-  python x_auto.py --dry-run                       # preview, don't POST anything
+  python x_auto.py                           # full pipeline (Phase 2 + 3, default)
+  python x_auto.py --claim-delay 25          # longer wait for X propagation
+  python x_auto.py --name qolvex21           # one account, full pipeline
+  python x_auto.py --skip-claim              # legacy Phase 2 only
+  python x_auto.py --dry-run                 # preview, don't POST anything
 
 Outputs:
   x_auto.log          human-readable log
@@ -546,16 +548,16 @@ def process_account(
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Auto-execute pending_x.json (follow/like) on X, "
-                    "optionally claiming the reward right after.",
+        description="Follow/like pending X tasks and claim the reward "
+                    "on claimyshare in one shot.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  python x_auto.py                                      # Phase 2 only: follow/like\n"
-            "  python x_auto.py --auto-claim                         # Phase 2 + Phase 3: claim reward too\n"
-            "  python x_auto.py --auto-claim --claim-delay 20        # wait 20s before claim\n"
-            "  python x_auto.py --name qolvex21 --auto-claim         # one account, full pipeline\n"
-            "  python x_auto.py --dry-run                            # preview only\n"
+            "  python x_auto.py                              # full pipeline (default)\n"
+            "  python x_auto.py --claim-delay 25             # longer X propagation wait\n"
+            "  python x_auto.py --name qolvex21              # one account only\n"
+            "  python x_auto.py --skip-claim                 # legacy: do X action, don't claim\n"
+            "  python x_auto.py --dry-run                    # preview only\n"
         ),
     )
     p.add_argument(
@@ -568,12 +570,12 @@ def _parse_args() -> argparse.Namespace:
         help="preview actions without POSTing to X.",
     )
     p.add_argument(
-        "--auto-claim",
+        "--skip-claim",
         action="store_true",
         help=(
-            "after each successful X action, wait --claim-delay seconds, then "
-            "POST /api/tasks/complete on claimyshare to credit the reward. "
-            "Requires bearer+cookie in config.json for each account."
+            "do the X follow/like but do NOT call /api/tasks/complete "
+            "afterwards. Legacy Phase-2-only mode — you'll need to run "
+            "tasks.py separately to actually credit the reward."
         ),
     )
     p.add_argument(
@@ -593,15 +595,19 @@ def main() -> int:
     args = _parse_args()
     log = make_logger("x_auto.log")
 
+    # Claim is the default; --skip-claim opts out for legacy 2-step mode.
+    auto_claim = not args.skip_claim
+
     pending = load_pending()
     accounts_pending: dict[str, list] = pending.get("accounts") or {}
 
     x_creds = load_x_accounts()
-    claim_creds_all = load_claimyshare_creds() if args.auto_claim else {}
+    claim_creds_all = load_claimyshare_creds() if auto_claim else {}
 
-    if args.auto_claim and not claim_creds_all:
-        log("[warn] --auto-claim requested but no accounts in config.json have "
-            "both bearer and cookie filled. Claim step will be skipped for all.")
+    if auto_claim and not claim_creds_all:
+        log("[warn] claim step requires bearer+cookie in config.json, but "
+            "none of the accounts have both filled. Claims will be skipped. "
+            "Run `python tasks.py` manually afterwards to credit rewards.")
 
     if args.name:
         if args.name not in accounts_pending:
@@ -615,7 +621,7 @@ def main() -> int:
     log(
         f"x_auto start | accounts_pending={list(accounts_pending.keys())} "
         f"x_accounts_filled={len(x_creds)} "
-        f"auto_claim={args.auto_claim} claim_delay={args.claim_delay}s "
+        f"auto_claim={auto_claim} claim_delay={args.claim_delay}s "
         f"dry_run={args.dry_run}"
     )
 
@@ -649,7 +655,7 @@ def main() -> int:
             creds,
             log,
             args.dry_run,
-            auto_claim=args.auto_claim,
+            auto_claim=auto_claim,
             claim_creds=claim_creds_all.get(name),
             claim_delay_sec=args.claim_delay,
         )
@@ -667,7 +673,7 @@ def main() -> int:
         f"invalid-target={grand_stats['invalid']} auth-fail={grand_stats['auth']} "
         f"rate-limit={grand_stats['rate_limit']} error={grand_stats['error']}"
     )
-    if args.auto_claim:
+    if auto_claim:
         log(
             f"  claim: ok={grand_stats['claim_ok']} "
             f"fail={grand_stats['claim_fail']} "
