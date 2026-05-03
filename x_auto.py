@@ -105,15 +105,24 @@ ACCOUNT_DELAY_MAX_SEC = 12
 HTTP_TIMEOUT_SEC = 20
 
 # --- Auto-claim (Phase 3) tunables ---
-# When --auto-claim is passed, after every successful X action we wait this
-# long to let X propagate the follow/like to its backend, then POST to
-# /api/tasks/complete on claimyshare. Too short -> server will still say
-# "not following this account yet" and we have to retry on next run.
+# After every successful X action we wait this long to let X propagate the
+# follow/like to its backend, then POST to /api/tasks/complete on
+# claimyshare. Too short -> server will still say "not following this
+# account yet" and we have to retry on next run.
 AUTO_CLAIM_DELAY_SEC_DEFAULT = 15
 # If the first claim attempt says "still verifying" / "try again later",
 # wait this much longer and retry, up to AUTO_CLAIM_MAX_RETRIES times.
 AUTO_CLAIM_RETRY_BACKOFF_SEC = 15
 AUTO_CLAIM_MAX_RETRIES = 2
+
+# --- "Already done" fast-path ---
+# When X says we already follow/like the target (code 160/158/139), the X
+# state has been stable for who-knows-how-long; there's no propagation to
+# wait for and no reason to throttle this account as heavily as a fresh
+# action. These shorter delays kick in ONLY when an action's outcome is
+# "already".
+ALREADY_ACTION_DELAY_SEC = 2   # sleep between actions after an "already" hit
+ALREADY_CLAIM_DELAY_SEC = 3    # claim-delay override for "already" actions
 
 # X error codes that mean "the action is already done" — treat as success.
 ALREADY_FOLLOWING_CODES = {160, 158}   # 160 = already requested, 158 = already following
@@ -450,6 +459,7 @@ def process_account(
     stats = {"ok": 0, "already": 0, "invalid": 0, "auth": 0,
              "rate_limit": 0, "error": 0,
              "claim_ok": 0, "claim_fail": 0, "claim_skip": 0}
+    last_outcome: str | None = None  # used to shorten delay after "already"
 
     for i, action in enumerate(actions):
         kind = action.get("action")
@@ -457,8 +467,16 @@ def process_account(
         task_id = action.get("task_id")
 
         if i > 0 and not dry_run:
-            sleep_s = random.uniform(ACTION_DELAY_MIN_SEC, ACTION_DELAY_MAX_SEC)
-            log(f"[{name}] sleeping {sleep_s:.1f}s before next action...")
+            # Fast path: if the previous action was an already-done no-op,
+            # X didn't actually change state, so we don't need to throttle
+            # this account as heavily.
+            if last_outcome == "already":
+                sleep_s: float = ALREADY_ACTION_DELAY_SEC
+                log(f"[{name}] prev action was already-done; using short "
+                    f"{sleep_s:.0f}s delay before next action.")
+            else:
+                sleep_s = random.uniform(ACTION_DELAY_MIN_SEC, ACTION_DELAY_MAX_SEC)
+                log(f"[{name}] sleeping {sleep_s:.1f}s before next action...")
             time.sleep(sleep_s)
 
         if dry_run:
@@ -517,12 +535,19 @@ def process_account(
                     "account; skipping claim.")
                 stats["claim_skip"] += 1
             else:
+                # Fast path: if X already had the action before we started,
+                # the state is stable — no propagation needed.
+                effective_claim_delay = (
+                    ALREADY_CLAIM_DELAY_SEC
+                    if outcome == "already"
+                    else claim_delay_sec
+                )
                 claim_outcome = try_auto_claim(
                     name=name,
                     task_id=task_id,
                     bearer=claim_creds["bearer"],
                     cookie=claim_creds["cookie"],
-                    initial_delay_sec=claim_delay_sec,
+                    initial_delay_sec=effective_claim_delay,
                     log=log,
                 )
                 if claim_outcome in ("ok", "already-done"):
@@ -537,6 +562,10 @@ def process_account(
                     stats["claim_fail"] += 1
                     if action not in still_pending:
                         still_pending.append(action)
+
+        # Remember this outcome so the NEXT iteration can decide how long
+        # to wait before firing its action.
+        last_outcome = outcome
 
     return still_pending, stats
 
