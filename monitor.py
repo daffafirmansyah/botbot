@@ -363,9 +363,9 @@ def _parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  python monitor.py                      # normal run\n"
-            "  python monitor.py --reset-cooldowns    # clear bogus cooldowns on startup\n"
-            "  python monitor.py --no-bootstrap       # skip chain scan on first run\n"
+            "  python monitor.py                      # normal run (no chain bootstrap)\n"
+            "  python monitor.py --bootstrap          # seed last_success_at from on-chain history (unique-wallet setups only)\n"
+            "  python monitor.py --reset-cooldowns    # clear all cooldowns on startup\n"
         ),
     )
     p.add_argument(
@@ -379,12 +379,18 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument(
-        "--no-bootstrap",
+        "--bootstrap",
         action="store_true",
         help=(
-            "Skip the bootstrap chain scan even if state.json has no prior "
-            "last_success_at for an account. Useful when the chain scan "
-            "would return a misleading timestamp (shared wallet)."
+            "Run the on-chain scan to seed last_success_at for accounts "
+            "with no prior history. DEFAULT IS OFF because most setups "
+            "have multiple accounts sharing one destination wallet, where "
+            "the scan can't tell which account got paid and would assign "
+            "the same (often wrong) cooldown to everyone. The shared-wallet "
+            "auto-skip in _bootstrap_accounts() already protects against "
+            "that, but turning bootstrap off entirely is simpler and avoids "
+            "any chain RPC noise on startup. Pass this flag if you have "
+            "unique wallets per account and want pre-populated cooldowns."
         ),
     )
     return p.parse_args()
@@ -416,7 +422,7 @@ def main() -> int:
     log(
         f"monitor started | accounts={len(accounts)} "
         f"poll={POLL_INTERVAL_SEC}s topup>={TOPUP_THRESHOLD_LAMPORTS/1e9:.6f} SOL "
-        f"reset_cooldowns={args.reset_cooldowns} no_bootstrap={args.no_bootstrap}"
+        f"reset_cooldowns={args.reset_cooldowns} bootstrap={args.bootstrap}"
     )
 
     state = load_state()
@@ -424,8 +430,10 @@ def main() -> int:
     if args.reset_cooldowns:
         _reset_cooldowns(accounts, state, log)
         # --reset-cooldowns implies skip-bootstrap (explicit "forget history").
-    elif not args.no_bootstrap:
+    elif args.bootstrap:
         _bootstrap_accounts(accounts, state, log)
+    else:
+        log("[bootstrap] skipped (default — use --bootstrap to opt in).")
 
     _log_startup_status(accounts, state, log)
 
