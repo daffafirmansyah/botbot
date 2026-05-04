@@ -21,6 +21,8 @@ Safety:
     modifying.
   - Pass --apply to actually write changes.
   - Pass --no-tsv to skip the accounts.tsv update.
+  - Pass --prune-empty-creds to also drop accounts.tsv rows whose
+    bearer_token OR cookie field is blank (rows never used in production).
 
 Usage on VPS:
   cd ~/botbot
@@ -276,12 +278,53 @@ def _write_tsv_rows(
     path.write_text(buf.getvalue(), encoding="utf-8")
 
 
-def apply_tsv_changes(plan: list[tuple[dict, str, str]]) -> None:
+def _row_has_blank_creds(row: dict[str, str]) -> bool:
+    """True when bearer_token OR cookie is blank/whitespace-only."""
+    bearer = str(row.get("bearer_token", "") or "").strip()
+    cookie = str(row.get("cookie", "") or "").strip()
+    return not bearer or not cookie
+
+
+def preview_tsv(prune_empty: bool) -> None:
+    """Print read-only stats about accounts.tsv during dry-run."""
+    if not ACCOUNTS_TSV_PATH.exists():
+        return
+    try:
+        _, rows, _ = _read_tsv_rows(ACCOUNTS_TSV_PATH)
+    except SystemExit:
+        raise
+    except Exception as e:  # pragma: no cover - defensive
+        print(f"[warn] accounts.tsv preview failed: {e}")
+        return
+
+    blank = [str(r.get("name", "")).strip() or "(no-name)"
+             for r in rows if _row_has_blank_creds(r)]
+    print(f"[info] accounts.tsv: {len(rows)} row(s), "
+          f"{len(blank)} with blank bearer/cookie")
+    if blank:
+        action = "WILL BE PRUNED" if prune_empty else "kept (use --prune-empty-creds to drop)"
+        preview = ", ".join(blank[:10]) + (f", ...(+{len(blank)-10})" if len(blank) > 10 else "")
+        print(f"[info] blank-creds rows {action}: {preview}")
+
+
+def apply_tsv_changes(
+    plan: list[tuple[dict, str, str]], prune_empty: bool = False
+) -> None:
     if not ACCOUNTS_TSV_PATH.exists():
         print(f"[warn] {ACCOUNTS_TSV_PATH.name} not found; skipping TSV update.")
         return
 
     fieldnames, rows, delim = _read_tsv_rows(ACCOUNTS_TSV_PATH)
+
+    pruned_names: list[str] = []
+    if prune_empty:
+        kept: list[dict[str, str]] = []
+        for row in rows:
+            if _row_has_blank_creds(row):
+                pruned_names.append(str(row.get("name", "")).strip() or "(no-name)")
+            else:
+                kept.append(row)
+        rows = kept
 
     name_to_wallet: dict[str, str] = {}
     for acc, new_wallet, _ in plan:
@@ -317,7 +360,12 @@ def apply_tsv_changes(plan: list[tuple[dict, str, str]]) -> None:
                 row["wallet_address"] = new_w  # idempotent overwrite
 
     _write_tsv_rows(ACCOUNTS_TSV_PATH, fieldnames, rows, delim)
-    print(f"[ok] {ACCOUNTS_TSV_PATH.name} updated ({touched} wallet field(s) changed)")
+    if pruned_names:
+        preview = ", ".join(pruned_names[:10]) + (
+            f", ...(+{len(pruned_names)-10})" if len(pruned_names) > 10 else "")
+        print(f"[ok] pruned {len(pruned_names)} row(s) with blank bearer/cookie: {preview}")
+    print(f"[ok] {ACCOUNTS_TSV_PATH.name} updated ({len(rows)} row(s) kept, "
+          f"{touched} wallet field(s) changed)")
 
 
 def main() -> None:
@@ -328,20 +376,16 @@ def main() -> None:
                    help="allow more accounts than capacity; extras stay unchanged")
     p.add_argument("--no-tsv", action="store_true",
                    help="skip updating accounts.tsv (only touch config.json)")
+    p.add_argument("--prune-empty-creds", action="store_true",
+                   help="drop accounts.tsv rows whose bearer_token or cookie is blank")
     args = p.parse_args()
 
     validate_pool()
     cfg, accounts = load_config()
 
     print(f"[info] config.json:  {len(accounts)} account(s)")
-    if not args.no_tsv and ACCOUNTS_TSV_PATH.exists():
-        try:
-            _, tsv_rows, _ = _read_tsv_rows(ACCOUNTS_TSV_PATH)
-            print(f"[info] accounts.tsv: {len(tsv_rows)} row(s)")
-        except SystemExit:
-            raise
-        except Exception as e:  # pragma: no cover - defensive
-            print(f"[warn] accounts.tsv preview failed: {e}")
+    if not args.no_tsv:
+        preview_tsv(prune_empty=args.prune_empty_creds)
     print(f"[info] pool: {len(POOL)} wallets * {ACCOUNTS_PER_WALLET} = "
           f"{len(POOL) * ACCOUNTS_PER_WALLET} normal slots + 1 daffa14 slot")
 
@@ -354,12 +398,14 @@ def main() -> None:
         if args.no_tsv:
             print("[dry-run] --no-tsv set: accounts.tsv would be SKIPPED")
         else:
-            print("[dry-run] --apply will also update accounts.tsv (use --no-tsv to skip)")
+            extra = " (+ prune blank-creds rows)" if args.prune_empty_creds else ""
+            print(f"[dry-run] --apply will also update accounts.tsv{extra} "
+                  "(use --no-tsv to skip)")
         return
 
     apply_changes(cfg, plan)
     if not args.no_tsv:
-        apply_tsv_changes(plan)
+        apply_tsv_changes(plan, prune_empty=args.prune_empty_creds)
     else:
         print("[info] --no-tsv set: accounts.tsv left untouched.")
 
