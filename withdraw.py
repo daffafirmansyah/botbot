@@ -16,6 +16,7 @@ Exit code reflects the best outcome across accounts:
 
 from __future__ import annotations
 
+import argparse
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -90,8 +91,68 @@ def _run_sequential(accounts: list[dict], log) -> list[int]:
     return results
 
 
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Claimyshare auto-withdraw (one-shot). Fires every account "
+                    "unless --only / --exclude is used."
+    )
+    p.add_argument(
+        "--only",
+        nargs="+",
+        metavar="NAME",
+        help="Fire only the given account name(s). Case-sensitive, exact match.",
+    )
+    p.add_argument(
+        "--exclude",
+        nargs="+",
+        metavar="NAME",
+        help="Skip the given account name(s). Case-sensitive, exact match.",
+    )
+    p.add_argument(
+        "--list",
+        action="store_true",
+        help="List all available account names and exit (no withdraw fired).",
+    )
+    return p.parse_args()
+
+
+def _filter_accounts(
+    accounts: list[dict], only: list[str] | None, exclude: list[str] | None
+) -> list[dict]:
+    available = {a["name"]: a for a in accounts}
+
+    if only:
+        unknown = [n for n in only if n not in available]
+        if unknown:
+            sys.exit(f"[error] --only contains unknown account(s): {unknown}. "
+                     f"Use --list to see available names.")
+        # Preserve the order from --only so the user controls dispatch order.
+        accounts = [available[n] for n in only]
+
+    if exclude:
+        unknown = [n for n in exclude if n not in available]
+        if unknown:
+            print(f"[warn] --exclude contains unknown account(s): {unknown} "
+                  f"(ignored).", file=sys.stderr)
+        accounts = [a for a in accounts if a["name"] not in set(exclude)]
+
+    return accounts
+
+
 def main() -> int:
+    args = _parse_args()
     accounts = load_accounts()
+
+    if args.list:
+        for a in accounts:
+            print(a["name"])
+        return EXIT_OK
+
+    accounts = _filter_accounts(accounts, args.only, args.exclude)
+    if not accounts:
+        print("[error] no accounts left after filtering.", file=sys.stderr)
+        return EXIT_API_ERROR
+
     log = make_logger("withdraw.log")
 
     log(
