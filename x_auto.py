@@ -95,12 +95,14 @@ USER_AGENT = (
 
 # Delay between actions for the SAME account. Random within [min, max].
 # X is sensitive to burst follow/like patterns from a single session.
-ACTION_DELAY_MIN_SEC = 30
-ACTION_DELAY_MAX_SEC = 90
+# 60-180s = 1-3 minute pacing, looks human-ish; lowers ban risk markedly.
+ACTION_DELAY_MIN_SEC = 60
+ACTION_DELAY_MAX_SEC = 180
 
 # Delay between accounts (smaller — different sessions, less suspicious).
-ACCOUNT_DELAY_MIN_SEC = 5
-ACCOUNT_DELAY_MAX_SEC = 12
+# 15-30s spreads load enough that X / claimyshare don't see a uniform tick.
+ACCOUNT_DELAY_MIN_SEC = 15
+ACCOUNT_DELAY_MAX_SEC = 30
 
 HTTP_TIMEOUT_SEC = 20
 
@@ -121,8 +123,8 @@ AUTO_CLAIM_MAX_RETRIES = 2
 # wait for and no reason to throttle this account as heavily as a fresh
 # action. These shorter delays kick in ONLY when an action's outcome is
 # "already".
-ALREADY_ACTION_DELAY_SEC = 2   # sleep between actions after an "already" hit
-ALREADY_CLAIM_DELAY_SEC = 3    # claim-delay override for "already" actions
+ALREADY_ACTION_DELAY_SEC = 5   # sleep between actions after an "already" hit
+ALREADY_CLAIM_DELAY_SEC = 5    # claim-delay override for "already" actions
 
 # X error codes that mean "the action is already done" — treat as success.
 ALREADY_FOLLOWING_CODES = {160, 158}   # 160 = already requested, 158 = already following

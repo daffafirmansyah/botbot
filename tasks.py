@@ -66,9 +66,9 @@ TASKS_COMPLETE_URL = "https://claimyshare.io/api/tasks/complete"
 # ---------------------------------------------------------------------------
 
 # Backend verifies follow/like against X's API after we POST. If we fire too
-# fast it returns "still verifying" / rate-limits us. 8s is the safe baseline
-# observed manually. Lower at your own risk.
-TASK_INTER_DELAY_SEC = 8
+# fast it returns "still verifying" / rate-limits us. 15s is conservative —
+# gives X enough time to propagate state. Lower at your own risk.
+TASK_INTER_DELAY_SEC = 15
 
 # Only attempt tasks whose title starts with one of these (case-insensitive).
 # Anything else (Register, Share, etc.) is skipped silently.
@@ -79,8 +79,10 @@ HTTP_TIMEOUT_SEC = 20
 
 # Parallel mode: fire multiple accounts at once. Each account still walks
 # its own task list sequentially with TASK_INTER_DELAY_SEC between tasks.
-MAX_PARALLEL_WORKERS = 8
-PARALLEL_STAGGER_MS = 500   # delay between account workers starting
+# Conservative defaults: 4 parallel workers + 2s stagger spread "burst" of
+# 64 accounts over ~2 minutes instead of seconds, lowering WAF / 429 risk.
+MAX_PARALLEL_WORKERS = 4
+PARALLEL_STAGGER_MS = 2000   # delay between account workers starting
 
 # Output file for tasks that need a real follow/like on X. Phase 2 (x_auto.py)
 # will consume this. Gitignored — never commit.
