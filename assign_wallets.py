@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
 One-shot helper to (re)assign withdraw `wallet_address` for every account in
-config.json from a fixed wallet pool.
+both config.json (runtime) AND accounts.tsv (bulk-import source-of-truth)
+from a fixed wallet pool. Updating both keeps the two files in sync so a
+later `add_account.py --bulk accounts.tsv` won't revert to old wallets.
 
 Rules:
   - Each "normal" wallet (POOL) is shared by AT MOST 2 accounts.
@@ -15,8 +17,10 @@ Safety:
   - Refuses to run if there are duplicate wallets in the pool (sanity).
   - Refuses to run if there are more "normal" accounts than capacity
     (33 wallets * 2 = 66) unless --truncate is passed.
-  - Writes a timestamped backup of config.json before modifying.
+  - Writes timestamped backups of config.json AND accounts.tsv before
+    modifying.
   - Pass --apply to actually write changes.
+  - Pass --no-tsv to skip the accounts.tsv update.
 
 Usage on VPS:
   cd ~/botbot
@@ -27,11 +31,20 @@ Usage on VPS:
 from __future__ import annotations
 
 import argparse
+import csv
+import io
 import json
 import shutil
 import sys
 from datetime import datetime
 from pathlib import Path
+
+# Reuse the same broken-line merger that add_account.py uses, so we read
+# accounts.tsv exactly the way bulk import does.
+try:
+    from add_account import _merge_broken_rows
+except ImportError as exc:  # pragma: no cover - defensive
+    sys.exit(f"[FATAL] cannot import add_account._merge_broken_rows: {exc}")
 
 # ---------------------------------------------------------------------------
 # Wallet pool (DO NOT EDIT casually — this is the source of truth)
@@ -77,7 +90,10 @@ DAFFA14_WALLET = "678rCoX51RMCJZq9i46zKP7LovPyb6AMw2J5W4rDKmnw"
 DAFFA14_NAME_LC = "daffa14"          # case-insensitive exact-match account name
 ACCOUNTS_PER_WALLET = 2
 
-CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
+SCRIPT_DIR = Path(__file__).resolve().parent
+CONFIG_PATH = SCRIPT_DIR / "config.json"
+ACCOUNTS_TSV_PATH = SCRIPT_DIR / "accounts.tsv"
+TSV_REQUIRED_FIELDS = ("name", "bearer_token", "cookie", "wallet_address", "amount_sol")
 
 
 # ---------------------------------------------------------------------------
@@ -205,18 +221,127 @@ def apply_changes(cfg: dict, plan: list[tuple[dict, str, str]]) -> None:
     print(f"[ok] {CONFIG_PATH.name} updated ({len(plan)} entries touched)")
 
 
+# ---------------------------------------------------------------------------
+# accounts.tsv update
+# ---------------------------------------------------------------------------
+
+def _read_tsv_rows(path: Path) -> tuple[list[str], list[dict[str, str]], str]:
+    """Return (fieldnames, rows, delimiter). Mirrors add_account.bulk_import."""
+    text = path.read_text(encoding="utf-8-sig")
+    if "\t" in text:
+        delimiter = "\t"
+    elif ";" in text:
+        delimiter = ";"
+    else:
+        delimiter = ","
+
+    raw_lines = text.splitlines()
+    if not raw_lines:
+        sys.exit(f"[FATAL] {path.name} is empty")
+
+    header_line = raw_lines[0]
+    data_lines, _absorbed = _merge_broken_rows(
+        raw_lines[1:], delimiter, len(TSV_REQUIRED_FIELDS)
+    )
+    merged = [header_line] + data_lines
+
+    reader = csv.DictReader(merged, delimiter=delimiter)
+    fieldnames = list(reader.fieldnames or [])
+    missing = [f for f in TSV_REQUIRED_FIELDS if f not in fieldnames]
+    if missing:
+        sys.exit(f"[FATAL] {path.name} missing required columns: {missing}")
+    rows = [dict(r) for r in reader]
+    return fieldnames, rows, delimiter
+
+
+def _write_tsv_rows(
+    path: Path, fieldnames: list[str], rows: list[dict[str, str]], delimiter: str
+) -> None:
+    """Write rows back. csv.writer will quote any value containing the
+    delimiter, a quote, or a newline so cookies with embedded newlines
+    survive a round-trip and stay parseable by add_account.bulk_import."""
+    buf = io.StringIO(newline="")
+    writer = csv.DictWriter(
+        buf,
+        fieldnames=fieldnames,
+        delimiter=delimiter,
+        quoting=csv.QUOTE_MINIMAL,
+        lineterminator="\n",
+    )
+    writer.writeheader()
+    for row in rows:
+        # csv.DictWriter writes None as the empty string by default; coerce
+        # explicitly so the output is deterministic.
+        writer.writerow({k: ("" if v is None else v) for k, v in row.items()})
+    path.write_text(buf.getvalue(), encoding="utf-8")
+
+
+def apply_tsv_changes(plan: list[tuple[dict, str, str]]) -> None:
+    if not ACCOUNTS_TSV_PATH.exists():
+        print(f"[warn] {ACCOUNTS_TSV_PATH.name} not found; skipping TSV update.")
+        return
+
+    fieldnames, rows, delim = _read_tsv_rows(ACCOUNTS_TSV_PATH)
+
+    name_to_wallet: dict[str, str] = {}
+    for acc, new_wallet, _ in plan:
+        nm = str(acc.get("name", "")).strip()
+        if nm:
+            name_to_wallet[nm] = new_wallet
+
+    tsv_names = {str(r.get("name", "")).strip() for r in rows if r.get("name")}
+    plan_names = set(name_to_wallet.keys())
+    only_in_tsv = sorted(tsv_names - plan_names)
+    only_in_plan = sorted(plan_names - tsv_names)
+    if only_in_tsv:
+        print(f"[warn] in {ACCOUNTS_TSV_PATH.name} but NOT in config.json: "
+              f"{only_in_tsv}  (these rows keep their current wallet_address)")
+    if only_in_plan:
+        print(f"[warn] in config.json but NOT in {ACCOUNTS_TSV_PATH.name}: "
+              f"{only_in_plan}  (no TSV row to update)")
+
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup = ACCOUNTS_TSV_PATH.with_suffix(f".tsv.bak.{ts}")
+    shutil.copy2(ACCOUNTS_TSV_PATH, backup)
+    print(f"[ok] backup written: {backup.name}")
+
+    touched = 0
+    for row in rows:
+        nm = str(row.get("name", "")).strip()
+        if nm in name_to_wallet:
+            new_w = name_to_wallet[nm]
+            if row.get("wallet_address", "") != new_w:
+                row["wallet_address"] = new_w
+                touched += 1
+            else:
+                row["wallet_address"] = new_w  # idempotent overwrite
+
+    _write_tsv_rows(ACCOUNTS_TSV_PATH, fieldnames, rows, delim)
+    print(f"[ok] {ACCOUNTS_TSV_PATH.name} updated ({touched} wallet field(s) changed)")
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--apply", action="store_true",
                    help="actually write changes (default: dry-run)")
     p.add_argument("--truncate", action="store_true",
                    help="allow more accounts than capacity; extras stay unchanged")
+    p.add_argument("--no-tsv", action="store_true",
+                   help="skip updating accounts.tsv (only touch config.json)")
     args = p.parse_args()
 
     validate_pool()
     cfg, accounts = load_config()
 
-    print(f"[info] config.json: {len(accounts)} account(s)")
+    print(f"[info] config.json:  {len(accounts)} account(s)")
+    if not args.no_tsv and ACCOUNTS_TSV_PATH.exists():
+        try:
+            _, tsv_rows, _ = _read_tsv_rows(ACCOUNTS_TSV_PATH)
+            print(f"[info] accounts.tsv: {len(tsv_rows)} row(s)")
+        except SystemExit:
+            raise
+        except Exception as e:  # pragma: no cover - defensive
+            print(f"[warn] accounts.tsv preview failed: {e}")
     print(f"[info] pool: {len(POOL)} wallets * {ACCOUNTS_PER_WALLET} = "
           f"{len(POOL) * ACCOUNTS_PER_WALLET} normal slots + 1 daffa14 slot")
 
@@ -226,13 +351,24 @@ def main() -> None:
 
     if not args.apply:
         print("\n[dry-run] no changes written. Re-run with --apply to commit.")
+        if args.no_tsv:
+            print("[dry-run] --no-tsv set: accounts.tsv would be SKIPPED")
+        else:
+            print("[dry-run] --apply will also update accounts.tsv (use --no-tsv to skip)")
         return
 
     apply_changes(cfg, plan)
+    if not args.no_tsv:
+        apply_tsv_changes(plan)
+    else:
+        print("[info] --no-tsv set: accounts.tsv left untouched.")
+
     print("\n[done] verify with:")
     print("  python -c \"import json; "
           "[print(a['name'], a['wallet_address'][:8]+'..') "
           "for a in json.load(open('config.json'))['accounts']]\"")
+    if not args.no_tsv:
+        print("  awk -F'\\t' 'NR>1{print $1, substr($4,1,8)\"..\"}' accounts.tsv | head")
 
 
 if __name__ == "__main__":
