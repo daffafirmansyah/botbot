@@ -78,12 +78,14 @@ PER_ACCOUNT_SPACING_SEC = 5
 # them. Drastically increases hit rate when hot wallet drains fast.
 # Trade-off: makes the burst pattern from one IP more visible to WAF.
 PARALLEL_FIRE = True
-# Bumped from 32 -> 64 once the 10-proxy pool went live: 64 concurrent
-# requests split across 10 exit IPs is only ~6-7 in-flight per IP, which
-# looks like normal residential browsing to CloudFlare. Without the proxy
-# pool, 64 from one IP would guarantee a 429 storm -- drop this back to
-# 32 (or lower) if proxies.json is ever empty so the bot stays gentle.
-MAX_PARALLEL_WORKERS = 64            # cap concurrent in-flight POSTs
+# Worker cap is adapted at startup (see main()) based on whether
+# proxies.json is populated:
+#   * pool populated  -> 64 (each IP only sees 64/N in-flight, safe)
+#   * pool empty      -> 32 (single-VPS IP; 64 guarantees 429 storm)
+# This default is the proxy-on number; main() tightens it when the pool
+# is empty so a silently-missing proxies.json can't re-introduce the
+# original self-DDoS pattern.
+MAX_PARALLEL_WORKERS = 64            # cap concurrent in-flight POSTs (auto-tightened to 32 if no proxy)
 # Stagger the parallel dispatch so account #N waits N * PARALLEL_STAGGER_MS
 # before its first request fires. 0 = pure burst (all reqs in same ms,
 # maximum sniping speed but high 429-storm risk — relies on aggressive retry
@@ -824,11 +826,12 @@ def main() -> int:
         f"precache={BALANCE_PRECACHE_ENABLED}"
     )
 
-    # Proxy pool status. We report it up-front so a silent fall-back to
-    # direct-connect (e.g. proxies.json missing after a deploy) can't hide
-    # as a mystery rate-limit regression later.
+    # Proxy pool status + adaptive worker cap. We report it up-front so a
+    # silent fall-back to direct-connect (e.g. proxies.json missing after
+    # a deploy) can't hide as a mystery rate-limit regression later.
     from core import load_proxies, get_proxy_for_account
     pool = load_proxies()
+    global MAX_PARALLEL_WORKERS
     if pool:
         # Show distribution: how many accounts land on each proxy slot.
         dist: dict[int, int] = {}
@@ -841,13 +844,26 @@ def main() -> int:
         )
         log(
             f"[proxy-pool] {len(pool)} proxy IP(s) active; "
-            f"{len(accounts)} account(s) distributed ({dist_str})."
+            f"{len(accounts)} account(s) distributed ({dist_str}); "
+            f"workers={MAX_PARALLEL_WORKERS}."
         )
     else:
-        log(
-            "[proxy-pool] no proxies.json or empty list; "
-            "all accounts use direct connection from VPS IP."
-        )
+        # Tighten worker cap when there's no proxy pool: 64 concurrent
+        # requests from one IP = instant CloudFlare 429 storm (observed).
+        if MAX_PARALLEL_WORKERS > 32:
+            old = MAX_PARALLEL_WORKERS
+            MAX_PARALLEL_WORKERS = 32
+            log(
+                f"[proxy-pool] no proxies.json or empty list; "
+                f"all accounts use direct connection from VPS IP. "
+                f"Auto-tightened MAX_PARALLEL_WORKERS {old} -> "
+                f"{MAX_PARALLEL_WORKERS} to avoid single-IP burst."
+            )
+        else:
+            log(
+                "[proxy-pool] no proxies.json or empty list; "
+                "all accounts use direct connection from VPS IP."
+            )
 
     state = load_state()
 
