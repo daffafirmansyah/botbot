@@ -120,7 +120,7 @@ def _print_grouped(rows: list[dict]) -> None:
             if status == "OK" and bal is not None:
                 if bal < core.MIN_WITHDRAW_SOL:
                     ready = "[dust]"
-                elif cd == "ready":
+                elif cd in ("ready", "no-history"):
                     ready = "[READY]"
                 else:
                     ready = f"[{cd}]"
@@ -139,13 +139,21 @@ def _print_summary(rows: list[dict]) -> None:
         if r["status"] not in ("OK", "AUTH-EXPIRED", "FORBIDDEN", "RATE-LIMITED")
     ]
 
+    # READY = will fire on next top-up. That's both:
+    #   * "ready"      -> already withdrew before, cooldown is over.
+    #   * "no-history" -> never withdrew yet, no cooldown to wait for.
+    # Only accounts whose cooldown string starts with "cooldown " are
+    # actually locked.
+    READY_STATES = ("ready", "no-history")
     ready = [
         r for r in ok_rows
-        if (r["balance"] or 0) >= core.MIN_WITHDRAW_SOL and r["cooldown"] == "ready"
+        if (r["balance"] or 0) >= core.MIN_WITHDRAW_SOL
+        and r["cooldown"] in READY_STATES
     ]
     cooldown = [
         r for r in ok_rows
-        if (r["balance"] or 0) >= core.MIN_WITHDRAW_SOL and r["cooldown"] != "ready"
+        if (r["balance"] or 0) >= core.MIN_WITHDRAW_SOL
+        and r["cooldown"] not in READY_STATES
     ]
     dust = [
         r for r in ok_rows
