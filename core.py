@@ -672,6 +672,7 @@ def attempt_withdraw(
     cfg: dict,
     log: Logger,
     verify_onchain: bool = True,
+    amount_sol_override: float | None = None,
 ) -> tuple[int, dict | None, int]:
     """
     Send exactly one POST to /api/withdraw for a single account config.
@@ -686,15 +687,37 @@ def attempt_withdraw(
         verify_onchain: if True (default), sleep 30s after a 2xx success and
              confirm the balance delta on-chain. Set False when iterating
              multiple accounts on a single top-up event to stay snappy.
+        amount_sol_override: if provided, skip the live /api/user fetch and
+             use this value as the withdraw amount. Used by monitor.py's
+             pre-cache so a top-up snipe doesn't pay the 0-17s rate-limit
+             retry tax on every account. Ignored when cfg has an explicit
+             numeric amount_sol (the cfg value already wins via the
+             existing branch).
 
     Returns (exit_code, parsed_body_or_none, http_status_or_0).
     """
     wallet = cfg["wallet_address"]
     name = cfg.get("name", "?")
 
-    # Resolve the amount: "auto" => fetch balanceSolTask from /api/user.
+    # Resolve the amount in this priority order:
+    #   1. cfg["amount_sol"] when it's an explicit positive number
+    #   2. amount_sol_override (passed in by caller, e.g. cached balance)
+    #   3. live GET /api/user (the original "auto" path)
     raw_amount = cfg.get("amount_sol", "auto")
-    if isinstance(raw_amount, str) and raw_amount.strip().lower() == "auto":
+    cfg_is_auto = isinstance(raw_amount, str) and raw_amount.strip().lower() == "auto"
+
+    if not cfg_is_auto:
+        amount = float(raw_amount)
+    elif amount_sol_override is not None:
+        amount = float(amount_sol_override)
+        if amount < MIN_WITHDRAW_SOL:
+            log(
+                f"[{name}] [skip] cached balance {amount:.9f} SOL below "
+                f"threshold {MIN_WITHDRAW_SOL} SOL; nothing to withdraw."
+            )
+            return EXIT_COOLDOWN, None, 0
+        log(f"[{name}] [cached] using cached balance = {amount:.9f} SOL.")
+    else:
         balance = fetch_claimable_balance(cfg, log)
         if balance is None:
             log(f"[{name}] [error] could not fetch claimable balance; skipping.")
@@ -707,8 +730,6 @@ def attempt_withdraw(
             return EXIT_COOLDOWN, None, 0
         amount = balance
         log(f"[{name}] [auto] claimable balance = {amount:.9f} SOL; withdrawing that.")
-    else:
-        amount = float(raw_amount)
 
     pre: int | None = None
     if verify_onchain:

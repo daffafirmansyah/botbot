@@ -36,8 +36,10 @@ from core import (
     EXIT_COOLDOWN,
     EXIT_OK,
     HOT_WALLET,
+    MIN_WITHDRAW_SOL,
     attempt_withdraw,
     bootstrap_last_success_iso,
+    fetch_claimable_balance,
     get_account_state,
     get_balance_lamports,
     iso_to_unix,
@@ -88,6 +90,27 @@ HOT_WALLET_FLOOR_LAMPORTS = 200_000  # ~0.0002 SOL
 # the bot looks dead to an outside observer. Set to 0 to disable.
 HEARTBEAT_INTERVAL_SEC = 300  # 5 minutes
 
+# --- Balance pre-cache ---
+# A background thread continuously refreshes each account's claimable balance
+# from /api/user and stores it in an in-memory cache. When a top-up arrives,
+# _process_topup hands the cached value to attempt_withdraw via
+# amount_sol_override, skipping the live fetch (and its 0-17s rate-limit
+# retry tax) entirely. This is what makes the snipe "instant".
+#
+# Trade-off: balance can be slightly stale. claimyshare's balanceSolTask
+# only changes when the user completes a task or successfully withdraws,
+# both of which are events WE control, so staleness is bounded by our own
+# refresh cadence. Top-ups themselves do NOT change balanceSolTask (the
+# top-up refills claimyshare's hot wallet, not the user's claimable amount),
+# so a top-up never invalidates a cached value.
+BALANCE_PRECACHE_ENABLED = True
+BALANCE_REFRESH_SPACING_SEC = 1.5    # delay between accounts inside one pass
+BALANCE_REFRESH_GAP_SEC = 30         # extra rest after a full pass through all accounts
+BALANCE_CACHE_MAX_AGE_SEC = 600.0    # use cached value if fetched within last 10 min
+# How long after startup we wait before declaring the cache "ready". Until
+# this point a top-up is allowed to fall back to live-fetch on cache miss.
+BALANCE_CACHE_WARMUP_SEC = 90.0
+
 _stop = False
 
 
@@ -95,6 +118,124 @@ def _handle_sigint(signum, frame):  # noqa: ARG001
     global _stop
     _stop = True
     print("\n[monitor] stop requested, finishing current iteration...", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Balance cache
+# ---------------------------------------------------------------------------
+
+class BalanceCache:
+    """Thread-safe per-account cache of /api/user `balanceSolTask`.
+
+    A background thread populates this from claimyshare every
+    BALANCE_REFRESH_SPACING_SEC; consumers (the top-up firing path) read it
+    via .get(name) and pass the value to attempt_withdraw via
+    amount_sol_override so they don't have to pay the live-fetch tax
+    inside the snipe window.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        # name -> (balance_or_None, fetched_at_unix)
+        self._cache: dict[str, tuple[Optional[float], float]] = {}
+        self._started_at = time.time()
+
+    def update(self, name: str, balance: Optional[float]) -> None:
+        with self._lock:
+            self._cache[name] = (balance, time.time())
+
+    def get(
+        self, name: str, max_age_sec: float = BALANCE_CACHE_MAX_AGE_SEC
+    ) -> Optional[float]:
+        """Return cached balance if present and fresh; else None."""
+        with self._lock:
+            entry = self._cache.get(name)
+            if entry is None:
+                return None
+            balance, ts = entry
+            if time.time() - ts > max_age_sec:
+                return None
+            return balance
+
+    def is_warmed_up(self) -> bool:
+        """True after BALANCE_CACHE_WARMUP_SEC since startup.
+
+        Top-up handler uses this to decide whether a cache miss should fall
+        back to live-fetch (still in warmup) vs treat the miss as a real
+        skip (cache is supposed to be populated by now).
+        """
+        return (time.time() - self._started_at) >= BALANCE_CACHE_WARMUP_SEC
+
+    def stats(self) -> dict:
+        with self._lock:
+            now = time.time()
+            ages = [now - ts for _, ts in self._cache.values()]
+            return {
+                "size": len(self._cache),
+                "freshest_age": min(ages) if ages else 0.0,
+                "oldest_age": max(ages) if ages else 0.0,
+            }
+
+
+def _balance_refresher_loop(
+    accounts: list[dict], cache: BalanceCache, log
+) -> None:
+    """Background loop: rotate through accounts, refreshing each balance.
+
+    Per-account spacing keeps us under the per-IP rate window so the
+    refresh itself doesn't trigger 429s. After a full pass we sleep
+    BALANCE_REFRESH_GAP_SEC extra so total cycle time stays generous.
+    """
+    while not _stop:
+        for acc in accounts:
+            if _stop:
+                return
+            name = acc.get("name", "?")
+            try:
+                # Silent on success, escalate on errors only.
+                msgs: list[str] = []
+                balance = fetch_claimable_balance(
+                    acc, lambda m: msgs.append(m)
+                )
+                cache.update(name, balance)
+                if balance is None:
+                    # First failure for an account is worth knowing about;
+                    # downgrade to one-line summary to avoid log spam.
+                    last = msgs[-1] if msgs else "unknown error"
+                    log(f"[balance-cache] {name}: refresh failed ({last[:120]})")
+            except Exception as e:  # noqa: BLE001
+                log(f"[balance-cache] {name}: exception {e}")
+            # Spacing between accounts within one pass.
+            for _ in range(int(BALANCE_REFRESH_SPACING_SEC * 10)):
+                if _stop:
+                    return
+                time.sleep(0.1)
+        # Extra rest after a full sweep.
+        if _stop:
+            return
+        stats = cache.stats()
+        log(
+            f"[balance-cache] full sweep done | size={stats['size']} "
+            f"freshest={stats['freshest_age']:.0f}s oldest={stats['oldest_age']:.0f}s | "
+            f"sleeping {BALANCE_REFRESH_GAP_SEC}s before next pass."
+        )
+        for _ in range(BALANCE_REFRESH_GAP_SEC):
+            if _stop:
+                return
+            time.sleep(1)
+
+
+def _start_balance_refresher(
+    accounts: list[dict], cache: BalanceCache, log
+) -> threading.Thread:
+    t = threading.Thread(
+        target=_balance_refresher_loop,
+        args=(accounts, cache, log),
+        name="balance-refresher",
+        daemon=True,
+    )
+    t.start()
+    return t
 
 
 def _human_duration(sec: float) -> str:
@@ -248,40 +389,99 @@ def _fire_one_threaded(
     state_lock: threading.Lock,
     log,
     start_delay_sec: float = 0.0,
+    amount_sol_override: Optional[float] = None,
 ) -> tuple[dict, int]:
     """Worker thread body: optional initial delay (for staggered dispatch),
-    then mark attempt, fire, update state safely."""
+    then mark attempt, fire, update state safely. Pass-through of
+    amount_sol_override lets the snipe path skip the live balance fetch.
+    """
     if start_delay_sec > 0:
         time.sleep(start_delay_sec)
     with state_lock:
         entry = get_account_state(state, acc["name"])
         entry["last_attempt_ts"] = time.time()
     log(f"[{acc['name']}] [fire] starting withdraw.")
-    exit_code, _parsed, _status = attempt_withdraw(acc, log, verify_onchain=False)
+    exit_code, _parsed, _status = attempt_withdraw(
+        acc, log, verify_onchain=False, amount_sol_override=amount_sol_override
+    )
     with state_lock:
         _record_attempt_outcome(state, acc, exit_code, log)
     return acc, exit_code
+
+
+def _resolve_overrides(
+    eligible: list[dict],
+    cache: Optional[BalanceCache],
+    log,
+) -> tuple[list[tuple[dict, Optional[float]]], int, int, int]:
+    """For each eligible account decide whether the snipe will use a cached
+    balance, fall back to live fetch, or skip outright (cache says dust).
+
+    Returns (kept, hits, misses, dust_skipped) where `kept` is the list of
+    (acc, override) tuples to actually fire. Accounts in dust state are
+    pre-filtered here so they never even occupy a worker slot.
+    """
+    kept: list[tuple[dict, Optional[float]]] = []
+    hits = 0
+    misses = 0
+    dust = 0
+
+    for acc in eligible:
+        name = acc.get("name", "?")
+        if cache is None:
+            kept.append((acc, None))  # legacy live-fetch path
+            misses += 1
+            continue
+        cached = cache.get(name)
+        if cached is None:
+            # Miss. If we're still warming up, give the live-fetch path a
+            # chance; if we're fully warm, this likely means a real auth or
+            # network failure earlier — let the worker log it via live-fetch.
+            kept.append((acc, None))
+            misses += 1
+            continue
+        if cached < MIN_WITHDRAW_SOL:
+            dust += 1
+            log(
+                f"[{name}] [pre-skip] cached balance {cached:.9f} SOL below "
+                f"threshold {MIN_WITHDRAW_SOL}; not firing."
+            )
+            continue
+        kept.append((acc, cached))
+        hits += 1
+
+    return kept, hits, misses, dust
 
 
 def _process_topup_parallel(
     eligible: list[dict],
     state: dict,
     log,
+    cache: Optional[BalanceCache] = None,
 ) -> None:
+    plan, hits, misses, dust = _resolve_overrides(eligible, cache, log)
+    if not plan:
+        log(f"[parallel] no accounts to fire (cache hits={hits} misses={misses} dust-skip={dust}).")
+        return
+
     stagger = max(PARALLEL_STAGGER_MS, 0) / 1000.0
-    total_dispatch = stagger * (len(eligible) - 1)
+    total_dispatch = stagger * (len(plan) - 1)
     log(
-        f"[parallel] firing {len(eligible)} account(s) "
-        f"(max workers={MAX_PARALLEL_WORKERS}, "
+        f"[parallel] firing {len(plan)} account(s) "
+        f"(cache hits={hits} misses={misses} dust-skip={dust}; "
+        f"max workers={MAX_PARALLEL_WORKERS}, "
         f"stagger={PARALLEL_STAGGER_MS}ms => dispatch window {total_dispatch:.1f}s)."
     )
     state_lock = threading.Lock()
-    workers = min(MAX_PARALLEL_WORKERS, len(eligible))
+    workers = min(MAX_PARALLEL_WORKERS, len(plan))
 
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="wd") as ex:
         futures = [
-            ex.submit(_fire_one_threaded, acc, state, state_lock, log, i * stagger)
-            for i, acc in enumerate(eligible)
+            ex.submit(
+                _fire_one_threaded, acc, state, state_lock, log,
+                i * stagger, override,
+            )
+            for i, (acc, override) in enumerate(plan)
         ]
         for fut in as_completed(futures):
             try:
@@ -290,15 +490,25 @@ def _process_topup_parallel(
                 log(f"[error] worker thread crashed: {e}")
 
     save_state(state)
-    log(f"[parallel] all {len(eligible)} attempts complete.")
+    log(f"[parallel] all {len(plan)} attempts complete.")
 
 
 def _process_topup_sequential(
     eligible: list[dict],
     state: dict,
     log,
+    cache: Optional[BalanceCache] = None,
 ) -> None:
-    for i, acc in enumerate(eligible):
+    plan, hits, misses, dust = _resolve_overrides(eligible, cache, log)
+    if not plan:
+        log(f"[sequential] no accounts to fire (cache hits={hits} misses={misses} dust-skip={dust}).")
+        return
+    log(
+        f"[sequential] firing {len(plan)} account(s) "
+        f"(cache hits={hits} misses={misses} dust-skip={dust})."
+    )
+
+    for i, (acc, override) in enumerate(plan):
         if _stop:
             break
 
@@ -309,18 +519,20 @@ def _process_topup_sequential(
                 log(
                     f"[topup] hot wallet drained to "
                     f"{current_hot_now/1e9:.9f} SOL; aborting remaining "
-                    f"{len(eligible) - i} account(s)."
+                    f"{len(plan) - i} account(s)."
                 )
                 break
 
         entry = get_account_state(state, acc["name"])
-        log(f"[{acc['name']}] [fire] {i + 1}/{len(eligible)} starting withdraw.")
+        log(f"[{acc['name']}] [fire] {i + 1}/{len(plan)} starting withdraw.")
         entry["last_attempt_ts"] = time.time()
-        exit_code, _parsed, _status = attempt_withdraw(acc, log, verify_onchain=False)
+        exit_code, _parsed, _status = attempt_withdraw(
+            acc, log, verify_onchain=False, amount_sol_override=override
+        )
         _record_attempt_outcome(state, acc, exit_code, log)
         save_state(state)
 
-        if i < len(eligible) - 1 and not _stop:
+        if i < len(plan) - 1 and not _stop:
             _sleep_with_stop(INTER_ACCOUNT_SPACING_SEC)
 
 
@@ -330,6 +542,7 @@ def _process_topup(
     current_hot: int,
     prev_hot: int,
     log,
+    cache: Optional[BalanceCache] = None,
 ) -> None:
     """Dispatch eligible accounts on a single top-up event."""
     now = time.time()
@@ -352,9 +565,9 @@ def _process_topup(
         return
 
     if PARALLEL_FIRE:
-        _process_topup_parallel(eligible, state, log)
+        _process_topup_parallel(eligible, state, log, cache)
     else:
-        _process_topup_sequential(eligible, state, log)
+        _process_topup_sequential(eligible, state, log, cache)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -422,7 +635,8 @@ def main() -> int:
     log(
         f"monitor started | accounts={len(accounts)} "
         f"poll={POLL_INTERVAL_SEC}s topup>={TOPUP_THRESHOLD_LAMPORTS/1e9:.6f} SOL "
-        f"reset_cooldowns={args.reset_cooldowns} bootstrap={args.bootstrap}"
+        f"reset_cooldowns={args.reset_cooldowns} bootstrap={args.bootstrap} "
+        f"precache={BALANCE_PRECACHE_ENABLED}"
     )
 
     state = load_state()
@@ -436,6 +650,19 @@ def main() -> int:
         log("[bootstrap] skipped (default — use --bootstrap to opt in).")
 
     _log_startup_status(accounts, state, log)
+
+    # Start the balance pre-cache refresher. Daemon thread, so it dies with
+    # the main loop. First snipe inside BALANCE_CACHE_WARMUP_SEC after
+    # startup may still hit live-fetch for cache misses.
+    cache: Optional[BalanceCache] = None
+    if BALANCE_PRECACHE_ENABLED:
+        cache = BalanceCache()
+        _start_balance_refresher(accounts, cache, log)
+        log(
+            f"[balance-cache] refresher started (spacing={BALANCE_REFRESH_SPACING_SEC}s, "
+            f"gap={BALANCE_REFRESH_GAP_SEC}s, max_age={BALANCE_CACHE_MAX_AGE_SEC:.0f}s, "
+            f"warmup={BALANCE_CACHE_WARMUP_SEC:.0f}s)."
+        )
 
     last_balance = int(state.get("last_hot_balance_lamports", 0))
     # For log-throttling only.
@@ -466,7 +693,7 @@ def main() -> int:
         if topup_detected:
             eligible_count = len(_eligible_accounts(accounts, state, now))
             if eligible_count > 0:
-                _process_topup(accounts, state, current, last_balance, log)
+                _process_topup(accounts, state, current, last_balance, log, cache)
             else:
                 # Top-up but everyone is on cooldown — log once, then move on.
                 log(
