@@ -121,9 +121,20 @@ HTTP_TIMEOUT_SEC = 20
 # account yet" and we have to retry on next run.
 AUTO_CLAIM_DELAY_SEC_DEFAULT = 15
 # If the first claim attempt says "still verifying" / "try again later",
-# wait this much longer and retry, up to AUTO_CLAIM_MAX_RETRIES times.
-AUTO_CLAIM_RETRY_BACKOFF_SEC = 15
-AUTO_CLAIM_MAX_RETRIES = 2
+# fall through this progressive backoff schedule. Each entry is the wait
+# BEFORE the next attempt. The schedule is sized so the cumulative wait
+# crosses the per-JWT 3 req / 60s window after retry 1, guaranteeing the
+# rate-limit counter has reset by the time we re-fire:
+#
+#   attempt 1 (initial after claim_delay) -> may be throttled
+#   wait 60s   (full window reset)
+#   attempt 2 -> if still throttled,
+#   wait 90s
+#   attempt 3 -> last try
+#
+# Total worst-case: claim_delay + 60 + 90 = ~165s per task.
+AUTO_CLAIM_RETRY_WAITS_SEC = (60, 90)
+AUTO_CLAIM_MAX_RETRIES = len(AUTO_CLAIM_RETRY_WAITS_SEC)
 
 # --- "Already done" fast-path ---
 # When X says we already follow/like the target (code 160/158/139), the X
@@ -340,9 +351,10 @@ def try_auto_claim(
             log(f"[{name}] [auto-claim] [already-done] task {task_id}.")
             return "already-done"
         if outcome in ("need-follow", "need-like"):
-            # X action hasn't propagated yet. One more retry with backoff.
+            # X action hasn't propagated yet. Use progressive backoff so the
+            # next try falls outside the 60s rate-limit window.
             if attempt <= AUTO_CLAIM_MAX_RETRIES:
-                backoff = AUTO_CLAIM_RETRY_BACKOFF_SEC
+                backoff = AUTO_CLAIM_RETRY_WAITS_SEC[attempt - 1]
                 log(
                     f"[{name}] [auto-claim] server says '{outcome}' on task "
                     f"{task_id}; waiting {backoff}s and retrying "
@@ -356,7 +368,7 @@ def try_auto_claim(
             return outcome
         if outcome == "throttled":
             if attempt <= AUTO_CLAIM_MAX_RETRIES:
-                backoff = AUTO_CLAIM_RETRY_BACKOFF_SEC
+                backoff = AUTO_CLAIM_RETRY_WAITS_SEC[attempt - 1]
                 log(f"[{name}] [auto-claim] throttled; waiting {backoff}s "
                     f"(attempt {attempt}/{AUTO_CLAIM_MAX_RETRIES})...")
                 time.sleep(backoff)
