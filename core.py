@@ -586,27 +586,60 @@ def claimyshare_post(url: str, *, headers: dict, json: dict, timeout: int) -> An
     return requests.post(url, headers=headers, json=json, timeout=timeout)
 
 
+# Retry budget for fetch_claimable_balance. This call sits on the hot path
+# of monitor.py / withdraw.py during a snipe so we keep the schedule SHORT
+# (total ~17s worst case) — better to fail fast and let the outer caller
+# retry the whole withdraw than to hold up a top-up window for 3 minutes.
+# For non-snipe contexts (diagnose.py, manual scripts) the schedule is
+# still long enough to clear a transient per-IP rate-limit hiccup.
+BALANCE_FETCH_RETRY_WAITS_SEC = (2, 5, 10)
+BALANCE_FETCH_MAX_RETRIES = len(BALANCE_FETCH_RETRY_WAITS_SEC)
+
+
 def fetch_claimable_balance(cfg: dict, log: Logger) -> float | None:
     """
     GET /api/user with this account's credentials and return the
     `balanceSolTask` field as a float (SOL).
 
-    Returns None on any failure (network, non-200, non-JSON, missing or
-    non-numeric field). Callers should treat None as "cannot proceed".
+    Retries 429 / 5xx with a short progressive backoff so a single
+    rate-limit hiccup doesn't spuriously skip a top-up. Returns None only
+    after exhausting retries or on a permanent failure (network, non-2xx,
+    non-JSON, missing field). Callers should treat None as "cannot
+    proceed".
     """
     name = cfg.get("name", "?")
     headers = build_headers(cfg["bearer_token"], cfg["cookie"])
     # Balance fetch is a read from the app root, not the /withdraw page.
     headers["referer"] = "https://claimyshare.io/"
 
-    try:
-        resp = claimyshare_get(USER_API_URL, headers=headers, timeout=15)
-    except Exception as e:  # noqa: BLE001 - both requests & curl_cffi raise here
-        log(f"[{name}] [balance] network error: {e}")
-        return None
+    last_status = 0
+    for attempt in range(1, BALANCE_FETCH_MAX_RETRIES + 2):  # initial + retries
+        try:
+            resp = claimyshare_get(USER_API_URL, headers=headers, timeout=15)
+        except Exception as e:  # noqa: BLE001 - both requests & curl_cffi raise
+            log(f"[{name}] [balance] network error: {e}")
+            return None
 
-    if resp.status_code != 200:
-        log(f"[{name}] [balance] unexpected status {resp.status_code}.")
+        last_status = resp.status_code
+        if resp.status_code == 200:
+            break
+
+        retryable = resp.status_code == 429 or 500 <= resp.status_code < 600
+        if not retryable or attempt > BALANCE_FETCH_MAX_RETRIES:
+            log(f"[{name}] [balance] unexpected status {resp.status_code}.")
+            return None
+
+        wait = BALANCE_FETCH_RETRY_WAITS_SEC[attempt - 1]
+        log(
+            f"[{name}] [balance] status={resp.status_code} "
+            f"(attempt {attempt}/{BALANCE_FETCH_MAX_RETRIES}); sleeping "
+            f"{wait}s then retrying."
+        )
+        time.sleep(wait)
+    else:
+        # Loop fell through without `break` -> last attempt was non-200.
+        log(f"[{name}] [balance] gave up after {BALANCE_FETCH_MAX_RETRIES + 1} "
+            f"attempt(s); last status={last_status}.")
         return None
 
     try:
