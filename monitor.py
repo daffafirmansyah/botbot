@@ -641,12 +641,26 @@ def _process_topup_parallel(
     log(
         f"[parallel] firing {len(plan)} account(s) "
         f"(cache hits={hits} misses={misses} dust-skip={dust}; "
-        f"max workers={MAX_PARALLEL_WORKERS}, "
+        f"workers={len(plan)} [coverage-first: 1 thread per account, no queueing], "
         f"stagger={PARALLEL_STAGGER_MS}ms => dispatch window {total_dispatch:.1f}s; "
         f"priority top5: {top_previews})."
     )
     state_lock = threading.Lock()
-    workers = min(MAX_PARALLEL_WORKERS, len(plan))
+    # COVERAGE-FIRST sizing: one worker per plan entry so every account
+    # gets dispatched immediately. The previous min(MAX_PARALLEL_WORKERS,
+    # len(plan)) cap meant the bottom (len(plan) - cap) accounts sat in
+    # the executor queue while the first batch chewed through infinite
+    # 429 retries -- by the time a slot freed up, the hot wallet was
+    # already drained and the queued accounts never fired at all.
+    #
+    # Trade-off: this temporarily uses more concurrent /api/withdraw
+    # connections than MAX_PARALLEL_WORKERS suggests when no proxy is
+    # active. CloudFlare will 429-storm the burst, but core.py's infinite
+    # retry policy absorbs that and at least every account gets one shot
+    # before the wallet drains. Dust entries (~20/64) short-circuit at
+    # the threshold guard inside attempt_withdraw with no API call, so
+    # the real concurrent POST count is closer to len(real_eligible).
+    workers = len(plan)
 
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="wd") as ex:
         futures = [
@@ -847,12 +861,18 @@ def main() -> int:
         f"precache={BALANCE_PRECACHE_ENABLED}"
     )
 
-    # Proxy pool status + adaptive worker cap. We report it up-front so a
-    # silent fall-back to direct-connect (e.g. proxies.json missing after
-    # a deploy) can't hide as a mystery rate-limit regression later.
+    # Proxy pool status. We report it up-front so a silent fall-back to
+    # direct-connect (e.g. proxies.json missing after a deploy) can't
+    # hide as a mystery rate-limit regression later.
+    #
+    # NOTE on workers: _process_topup_parallel now uses workers=len(plan)
+    # (one thread per account, no queueing) so MAX_PARALLEL_WORKERS is
+    # only relevant as a soft hint. Coverage > burst-gentleness for the
+    # snipe use case -- if we cap workers, accounts queued behind the
+    # cap never fire when first-batch workers loop on infinite 429
+    # retries until the hot wallet drains.
     from core import load_proxies, get_proxy_for_account
     pool = load_proxies()
-    global MAX_PARALLEL_WORKERS
     if pool:
         # Show distribution: how many accounts land on each proxy slot.
         dist: dict[int, int] = {}
@@ -866,25 +886,16 @@ def main() -> int:
         log(
             f"[proxy-pool] {len(pool)} proxy IP(s) active; "
             f"{len(accounts)} account(s) distributed ({dist_str}); "
-            f"workers={MAX_PARALLEL_WORKERS}."
+            f"fire mode=coverage-first (workers=len(plan))."
         )
     else:
-        # Tighten worker cap when there's no proxy pool: 64 concurrent
-        # requests from one IP = instant CloudFlare 429 storm (observed).
-        if MAX_PARALLEL_WORKERS > 32:
-            old = MAX_PARALLEL_WORKERS
-            MAX_PARALLEL_WORKERS = 32
-            log(
-                f"[proxy-pool] no proxies.json or empty list; "
-                f"all accounts use direct connection from VPS IP. "
-                f"Auto-tightened MAX_PARALLEL_WORKERS {old} -> "
-                f"{MAX_PARALLEL_WORKERS} to avoid single-IP burst."
-            )
-        else:
-            log(
-                "[proxy-pool] no proxies.json or empty list; "
-                "all accounts use direct connection from VPS IP."
-            )
+        log(
+            "[proxy-pool] no proxies.json or empty list; "
+            "all accounts use direct connection from VPS IP. "
+            "fire mode=coverage-first (workers=len(plan)); expect "
+            "CloudFlare 429 storm on burst -- absorbed by infinite "
+            "retry policy in core.py."
+        )
 
     state = load_state()
 

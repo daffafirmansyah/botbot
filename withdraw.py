@@ -231,11 +231,16 @@ def _run_parallel(accounts: list[dict], log) -> list[int]:
         top_previews.append(f"{marker}{acc['name']}({ov_str})")
     log(
         f"[parallel] firing {len(plan)} account(s) "
-        f"(max workers={MAX_PARALLEL_WORKERS}, "
+        f"(workers={len(plan)} [coverage-first: 1 thread per account, no queueing], "
         f"stagger={PARALLEL_STAGGER_MS}ms => dispatch window {total_dispatch:.1f}s; "
         f"priority top5: {top_previews})."
     )
-    workers = min(MAX_PARALLEL_WORKERS, len(plan))
+    # COVERAGE-FIRST sizing: see monitor.py for the rationale. Capping
+    # workers at MAX_PARALLEL_WORKERS would let the bottom (len(plan) -
+    # cap) accounts starve in the queue while the first batch loops on
+    # infinite 429 retries -- by the time slots free, the snipe window
+    # is over and they never fire at all.
+    workers = len(plan)
     results: list[int] = []
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="wd") as ex:
         futures = [
