@@ -576,22 +576,59 @@ def load_proxies(path: Path = PROXIES_PATH) -> list[str]:
         return _PROXY_CACHE
 
 
-def get_proxy_for_account(account_name: str) -> Optional[str]:
-    """Stable-hash assignment of account -> proxy URL.
+_ACCOUNT_ORDER_CACHE: Optional[dict[str, int]] = None
+_ACCOUNT_ORDER_LOCK = threading.Lock()
 
-    Same account always maps to the same proxy as long as the pool size
-    doesn't change. Returns None if the pool is empty (direct-connect).
-    Uses zlib.crc32 rather than hash() because Python's hash() is salted
-    per-process and would scramble the mapping across bot restarts --
-    we want stability across restarts so account state / rate-limit
-    history on the proxy's IP carries over.
+
+def _load_account_order() -> dict[str, int]:
+    """
+    Return {account_name: sorted_index} built from config.json, cached.
+
+    Used for even round-robin distribution of accounts across the proxy
+    pool: account at sorted-index N goes to proxy (N % pool_size). With
+    64 accounts and 10 proxies this gives 7/7/7/7/6/6/6/6/6/6 (max diff
+    of 1), versus crc32-hash which clustered 13 on one proxy in
+    observation.
+
+    Cached because load_accounts() touches disk; hot-path callers hit
+    this on every balance fetch / withdraw.
+    """
+    global _ACCOUNT_ORDER_CACHE
+    with _ACCOUNT_ORDER_LOCK:
+        if _ACCOUNT_ORDER_CACHE is not None:
+            return _ACCOUNT_ORDER_CACHE
+        try:
+            accounts = load_accounts()
+            names = sorted(a.get("name", "") for a in accounts if a.get("name"))
+        except Exception:  # noqa: BLE001 - never fail the hot path
+            names = []
+        _ACCOUNT_ORDER_CACHE = {name: i for i, name in enumerate(names)}
+        return _ACCOUNT_ORDER_CACHE
+
+
+def get_proxy_for_account(account_name: str) -> Optional[str]:
+    """Stable assignment of account -> proxy URL.
+
+    Strategy: sort all config'd account names alphabetically, take this
+    account's position, and assign `pool[position % pool_size]`. Yields
+    perfectly even distribution (max diff of 1 between any two proxies)
+    as long as the account list and pool size don't change.
+
+    Fallback: if the account isn't in config.json (shouldn't happen in
+    practice), fall back to crc32-based assignment -- less even but at
+    least deterministic.
+
+    Returns None if the pool is empty (direct-connect, no proxy).
     """
     pool = load_proxies()
     if not pool:
         return None
-    import zlib
-    idx = zlib.crc32(account_name.encode("utf-8")) % len(pool)
-    return pool[idx]
+    order = _load_account_order()
+    idx = order.get(account_name)
+    if idx is None:
+        import zlib
+        idx = zlib.crc32(account_name.encode("utf-8"))
+    return pool[idx % len(pool)]
 
 
 def _proxies_dict(proxy_url: Optional[str]) -> Optional[dict]:
