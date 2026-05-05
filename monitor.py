@@ -112,6 +112,13 @@ BALANCE_CACHE_MAX_AGE_SEC = 600.0    # use cached value if fetched within last 1
 # How long after startup we wait before declaring the cache "ready". Until
 # this point a top-up is allowed to fall back to live-fetch on cache miss.
 BALANCE_CACHE_WARMUP_SEC = 90.0
+# Adaptive auto-pause: if the refresher hits this many consecutive failures
+# (every account in the current sweep returning None), it's a clear sign
+# the IP is in a hard CloudFlare rate-limit state and continuing to hit
+# /api/user is just keeping the WAF angry. Pause for the duration below
+# so the IP can actually cool down.
+BALANCE_REFRESH_FAIL_PAUSE_THRESHOLD = 10
+BALANCE_REFRESH_PAUSE_SEC = 300       # 5 minutes of zero traffic on /api/user
 # Persisted cache snapshot. Other tools (account_status.py) read this file
 # instead of hitting /api/user themselves, so a status check while the bot
 # is running doesn't double-burst the IP rate limit. Written after every
@@ -252,41 +259,77 @@ def _balance_refresher_loop(
     refresh itself doesn't trigger 429s. After a full pass we sleep
     BALANCE_REFRESH_GAP_SEC extra so total cycle time stays generous.
     """
+    consecutive_fails = 0
     while not _stop:
+        success_count = 0
+        fail_count = 0
+        paused = False
+
         for acc in accounts:
             if _stop:
                 return
             name = acc.get("name", "?")
             try:
-                # Silent on success, escalate on errors only. single_attempt
-                # = no retry: a 429 here will be seen again on next sweep,
-                # there's no urgency. Without this flag a rate-limit storm
-                # would amplify (each fail consumed 4 API calls × 17s).
+                # single_attempt = no retry. A 429 here will be seen again
+                # on next sweep, no urgency. Without this flag a rate-limit
+                # storm would amplify (each fail = 4 API calls × 17s).
                 msgs: list[str] = []
                 balance = fetch_claimable_balance(
                     acc, lambda m: msgs.append(m), single_attempt=True
                 )
                 cache.update(name, balance)
                 if balance is None:
+                    consecutive_fails += 1
+                    fail_count += 1
                     last = msgs[-1] if msgs else "unknown error"
                     log(f"[balance-cache] {name}: refresh failed ({last[:120]})")
+                else:
+                    consecutive_fails = 0
+                    success_count += 1
             except Exception as e:  # noqa: BLE001
+                consecutive_fails += 1
+                fail_count += 1
                 log(f"[balance-cache] {name}: exception {e}")
+
+            # Auto-pause: too many failures in a row -> IP is in a hard
+            # rate-limit state, continuing only keeps the WAF angry.
+            if consecutive_fails >= BALANCE_REFRESH_FAIL_PAUSE_THRESHOLD:
+                log(
+                    f"[balance-cache] {consecutive_fails} consecutive "
+                    f"failures -> pausing refresher for "
+                    f"{BALANCE_REFRESH_PAUSE_SEC}s to let IP cool down."
+                )
+                for _ in range(BALANCE_REFRESH_PAUSE_SEC):
+                    if _stop:
+                        return
+                    time.sleep(1)
+                consecutive_fails = 0
+                paused = True
+                break  # restart the sweep from the top
+
             # Spacing between accounts within one pass.
             for _ in range(int(BALANCE_REFRESH_SPACING_SEC * 10)):
                 if _stop:
                     return
                 time.sleep(0.1)
-        # Extra rest after a full sweep.
+
+        # End of one sweep iteration.
         if _stop:
             return
-        # Persist the cache so other tools can read it without burning
-        # API quota of their own.
-        cache.save_to_disk(BALANCE_CACHE_SNAPSHOT_PATH)
+        if paused:
+            # Don't write snapshot, don't sleep extra — the 5-min pause
+            # already covered the cool-down. Loop back for a fresh sweep.
+            continue
+
+        # Sweep finished normally.
+        if success_count > 0:
+            cache.save_to_disk(BALANCE_CACHE_SNAPSHOT_PATH)
         stats = cache.stats()
         log(
-            f"[balance-cache] full sweep done | size={stats['size']} "
-            f"freshest={stats['freshest_age']:.0f}s oldest={stats['oldest_age']:.0f}s | "
+            f"[balance-cache] sweep done | ok={success_count} "
+            f"fail={fail_count} | size={stats['size']} "
+            f"freshest={stats['freshest_age']:.0f}s "
+            f"oldest={stats['oldest_age']:.0f}s | "
             f"sleeping {BALANCE_REFRESH_GAP_SEC}s before next pass."
         )
         for _ in range(BALANCE_REFRESH_GAP_SEC):
