@@ -66,12 +66,73 @@ def _save_config(data: dict) -> None:
     )
 
 
+def _merge_broken_rows(
+    lines: list[str], delimiter: str, expected_cols: int
+) -> tuple[list[str], int]:
+    """Re-assemble physical lines into logical rows when a value (usually a
+    cookie or JWT pasted from a browser) contained a literal newline that
+    caused one logical row to be split across multiple physical lines.
+
+    Mirrors add_account._merge_broken_rows so refresh_creds parses the
+    same TSV that bulk import already supports.
+    """
+    expected_delims = expected_cols - 1
+    result: list[str] = []
+    absorbed = 0
+
+    i = 0
+    while i < len(lines):
+        current = lines[i]
+        if not current.strip():
+            i += 1
+            continue
+        if current.count(delimiter) >= expected_delims:
+            result.append(current)
+            i += 1
+            continue
+        merged = current
+        j = i + 1
+        while j < len(lines) and merged.count(delimiter) < expected_delims:
+            nxt = lines[j]
+            if not nxt.strip():
+                j += 1
+                continue
+            merged = merged + nxt
+            j += 1
+        result.append(merged)
+        absorbed += max(0, (j - i) - 1)
+        i = j if j > i else i + 1
+
+    return result, absorbed
+
+
 def _read_tsv(path: Path) -> list[dict]:
     if not path.exists():
         sys.exit(f"[error] TSV not found: {path}")
     text = path.read_text(encoding="utf-8-sig")
-    delimiter = "\t" if "\t" in text else ("," if "," in text else ";")
-    reader = csv.DictReader(text.splitlines(), delimiter=delimiter)
+    # Auto-detect delimiter the same way add_account.py does.
+    if "\t" in text:
+        delimiter = "\t"
+    elif ";" in text:
+        delimiter = ";"
+    else:
+        delimiter = ","
+
+    raw_lines = text.splitlines()
+    if not raw_lines:
+        sys.exit(f"[error] {path}: empty file.")
+    header_line = raw_lines[0]
+    data_lines, absorbed = _merge_broken_rows(
+        raw_lines[1:], delimiter, len(REQUIRED_FIELDS)
+    )
+    if absorbed > 0:
+        print(
+            f"  [info] auto-merged {absorbed} extra physical line(s) back "
+            f"into their logical rows (newline embedded in a cookie/bearer)."
+        )
+    merged_lines = [header_line] + data_lines
+
+    reader = csv.DictReader(merged_lines, delimiter=delimiter)
     if reader.fieldnames is None:
         sys.exit(f"[error] {path}: empty or no header.")
     missing = [f for f in REQUIRED_FIELDS if f not in {h.strip() for h in reader.fieldnames}]
