@@ -379,12 +379,21 @@ def _seconds_until_cooldown_ends(last_success_iso: Optional[str], now: float) ->
 
 
 def _eligible_accounts(accounts: list[dict], state: dict, now: float) -> list[dict]:
-    """Return accounts that are neither in daily cooldown nor in their own rate-limit window."""
+    """Return every account that's outside its own 5s same-account spacing.
+
+    Fire-all policy: we no longer skip the 24h post-success cooldown here.
+    Reasoning: the operator prefers paying one wasted API call per cooldowned
+    account over risking the rare case where state.json's last_success_at is
+    wrong (e.g. the account never actually got the SOL on-chain) and we'd
+    silently miss a live top-up. Server returns EXIT_COOLDOWN cheaply for
+    real cooldowns via is_cooldown_message(), so the cost is tiny.
+
+    PER_ACCOUNT_SPACING_SEC (5s) stays: it prevents the same account from
+    firing twice inside a single top-up burst (which *would* just 429).
+    """
     eligible: list[dict] = []
     for acc in accounts:
         entry = get_account_state(state, acc["name"])
-        if _seconds_until_cooldown_ends(entry["last_success_at"], now) > 0:
-            continue
         if now - float(entry["last_attempt_ts"]) < PER_ACCOUNT_SPACING_SEC:
             continue
         eligible.append(acc)
@@ -537,16 +546,20 @@ def _resolve_overrides(
     log,
 ) -> tuple[list[tuple[dict, Optional[float]]], int, int, int]:
     """For each eligible account decide whether the snipe will use a cached
-    balance, fall back to live fetch, or skip outright (cache says dust).
+    balance or fall back to live fetch. Fire-all policy: we do NOT skip
+    dust accounts anymore -- the cache balance can be stale (e.g. the user
+    completed a task 10 seconds ago and the refresher hasn't swept them
+    yet), and skipping them silently means we miss a live top-up for that
+    account. Let core.attempt_withdraw's own min-threshold guard handle
+    real zero-balance accounts; that costs zero API calls (early return).
 
-    Returns (kept, hits, misses, dust_skipped) where `kept` is the list of
-    (acc, override) tuples to actually fire. Accounts in dust state are
-    pre-filtered here so they never even occupy a worker slot.
+    Returns (kept, hits, misses, dust_skipped). `dust_skipped` is retained
+    in the signature for log compatibility but is always 0 under fire-all.
     """
     kept: list[tuple[dict, Optional[float]]] = []
     hits = 0
     misses = 0
-    dust = 0
+    dust = 0  # kept for log format compat; always 0 under fire-all policy
 
     for acc in eligible:
         name = acc.get("name", "?")
@@ -556,19 +569,14 @@ def _resolve_overrides(
             continue
         cached = cache.get(name)
         if cached is None:
-            # Miss. If we're still warming up, give the live-fetch path a
-            # chance; if we're fully warm, this likely means a real auth or
-            # network failure earlier — let the worker log it via live-fetch.
+            # Miss. live-fetch path handles it inside attempt_withdraw.
             kept.append((acc, None))
             misses += 1
             continue
-        if cached < MIN_WITHDRAW_SOL:
-            dust += 1
-            log(
-                f"[{name}] [pre-skip] cached balance {cached:.9f} SOL below "
-                f"threshold {MIN_WITHDRAW_SOL}; not firing."
-            )
-            continue
+        # Fire-all: pass every cached balance through as override, even if
+        # it's below MIN_WITHDRAW_SOL. core.attempt_withdraw's threshold
+        # guard returns EXIT_COOLDOWN cheaply for real dust, and a stale
+        # "dust" cache entry gets a chance to prove itself wrong.
         kept.append((acc, cached))
         hits += 1
 
@@ -675,13 +683,14 @@ def _process_topup_sequential(
 
 def _log_skip_reasons(accounts: list[dict], state: dict, now: float, log) -> None:
     """
-    Emit one log line per account that _eligible_accounts would drop, with
-    the concrete reason (daily cooldown hours remaining, or per-account
-    rate-limit window). Balance/dust skips are logged separately by
-    _resolve_overrides so we don't duplicate them here.
+    Under the fire-all policy the only real skip reason at dispatch time
+    is the 5s per-account spacing window (anti-double-fire within one
+    burst). We still log 24h-cooldown accounts as informational so the
+    operator can see who's "almost certainly going to bounce with
+    EXIT_COOLDOWN" in this burst, but the bot no longer skips them.
 
     Called only at fire time so the main heartbeat loop doesn't spam the
-    log every 10s with identical skip lines.
+    log every 10s with identical lines.
     """
     for acc in accounts:
         name = acc.get("name", "?")
@@ -689,11 +698,11 @@ def _log_skip_reasons(accounts: list[dict], state: dict, now: float, log) -> Non
         cd_remaining = _seconds_until_cooldown_ends(entry["last_success_at"], now)
         if cd_remaining > 0:
             log(
-                f"[{name}] [skip] in 24h cooldown, "
+                f"[{name}] [info] within 24h cooldown window, "
                 f"{cd_remaining/3600.0:.1f}h remaining "
-                f"(last success {entry['last_success_at']})."
+                f"(last success {entry['last_success_at']}); "
+                "firing anyway per fire-all policy."
             )
-            continue
         spacing_remaining = PER_ACCOUNT_SPACING_SEC - (
             now - float(entry["last_attempt_ts"])
         )
@@ -720,8 +729,8 @@ def _process_topup(
     skipped = len(accounts) - len(eligible)
     log(
         f"[topup] hot wallet {prev_hot/1e9:.9f} -> {current_hot/1e9:.9f} SOL "
-        f"(+{delta/1e9:.9f}); {len(eligible)} of {len(accounts)} account(s) "
-        f"eligible (skipped={skipped} via cooldown/rate-limit)."
+        f"(+{delta/1e9:.9f}); firing {len(eligible)} of {len(accounts)} account(s) "
+        f"(fire-all policy; skipped={skipped} via 5s per-account spacing only)."
     )
     if not eligible:
         return

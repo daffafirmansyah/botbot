@@ -274,12 +274,21 @@ def _parse_args() -> argparse.Namespace:
         help="List all available account names and exit (no withdraw fired).",
     )
     p.add_argument(
+        "--smart",
+        action="store_true",
+        help="Enable smart-filter (pre-skip cooldown + dust accounts). "
+             "DEFAULT IS FIRE-ALL: under competition the operator prefers "
+             "paying wasted API calls over missing accounts whose cache is "
+             "stale. Use --smart only when you explicitly want to cut API "
+             "volume (e.g. long-running hourly cron, not post-topup retries).",
+    )
+    # Back-compat: --force used to mean 'bypass smart-filter' when the default
+    # was filter-on. Now filter is off by default, so --force is a no-op we
+    # keep around so old scripts don't break.
+    p.add_argument(
         "--force",
         action="store_true",
-        help="Skip smart-filter (cooldown + dust-balance pre-check) and fire "
-             "every account regardless. Use this if you suspect state.json or "
-             "balance_cache.json is stale and want the server to be the "
-             "source of truth.",
+        help=argparse.SUPPRESS,  # hidden; no-op under fire-all default.
     )
     return p.parse_args()
 
@@ -323,14 +332,20 @@ def main() -> int:
 
     log = make_logger("withdraw.log")
 
-    if not args.force:
+    # Fire-all is the default. Operator can opt into smart-filter with --smart
+    # when they explicitly want to cut API volume (e.g. long cron).
+    if args.smart:
         accounts, _skip_counters = _filter_smart(accounts, log)
         if not accounts:
             log("[smart-filter] nothing to fire after filtering. "
-                "Use --force to override.")
+                "Drop --smart to fire every account.")
             return EXIT_COOLDOWN
     else:
-        log("[force] smart-filter disabled; firing every account.")
+        log(
+            f"[fire-all] firing every account ({len(accounts)} total); "
+            "cooldown/dust skips are delegated to core.attempt_withdraw's "
+            "own threshold + cooldown guards. Pass --smart for pre-filtering."
+        )
 
     log(
         f"one-shot start | accounts={[a['name'] for a in accounts]} "
