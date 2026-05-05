@@ -81,8 +81,9 @@ def _filter_smart(
     Returns (eligible_accounts, skip_counters).
     """
     state = load_state()
-    snapshot = load_balance_cache_snapshot()
-    balances = (snapshot or {}).get("balances") or {}
+    # load_balance_cache_snapshot returns dict[name, (balance, fetched_at)]
+    # already fresh-filtered via max_age_sec. None if missing/stale/malformed.
+    snapshot = load_balance_cache_snapshot() or {}
     now = time.time()
 
     eligible: list[dict] = []
@@ -107,21 +108,25 @@ def _filter_smart(
                 continue
 
         # 2. Balance check (balance_cache.json, populated by monitor.py)
-        bal_entry = balances.get(name)
+        # snapshot[name] is (balance_or_None, fetched_at_unix) or missing.
+        bal_entry = snapshot.get(name)
         if bal_entry is not None:
-            amt = bal_entry.get("amount_sol_task")
-            if isinstance(amt, (int, float)):
-                if amt < MIN_WITHDRAW_SOL:
+            balance, _ts = bal_entry
+            if isinstance(balance, (int, float)):
+                if balance < MIN_WITHDRAW_SOL:
                     log(
-                        f"[{name}] [skip] balance {amt:.6f} SOL below "
+                        f"[{name}] [skip] balance {balance:.6f} SOL below "
                         f"threshold {MIN_WITHDRAW_SOL} SOL."
                     )
                     skipped["dust"] += 1
                     continue
             else:
-                # cache entry present but amount missing/malformed -> keep,
+                # cache entry present but balance missing/None -> keep,
                 # server will tell us the real answer.
                 skipped["no_balance"] += 1
+        else:
+            # no cache entry at all -> keep, live fetch path.
+            skipped["no_balance"] += 1
 
         eligible.append(acc)
 
@@ -167,20 +172,21 @@ def _build_plan(
     enter the thread pool first and are the first 32 in flight. Unknown
     (override=None) accounts go last because they also pay live-fetch tax.
     """
-    snapshot = load_balance_cache_snapshot()
-    balances = (snapshot or {}).get("balances") or {}
+    # load_balance_cache_snapshot returns dict[name, (balance, fetched_at)]
+    # with stale entries already filtered out. None if file missing/malformed.
+    snapshot = load_balance_cache_snapshot() or {}
 
     plan: list[tuple[dict, float | None]] = []
     cache_hits = 0
     cache_misses = 0
     for acc in accounts:
         name = acc["name"]
-        bal_entry = balances.get(name)
+        bal_entry = snapshot.get(name)
         override: float | None = None
         if bal_entry is not None:
-            amt = bal_entry.get("amount_sol_task")
-            if isinstance(amt, (int, float)):
-                override = float(amt)
+            balance, _ts = bal_entry
+            if isinstance(balance, (int, float)):
+                override = float(balance)
                 cache_hits += 1
         if override is None:
             cache_misses += 1
