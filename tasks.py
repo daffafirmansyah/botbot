@@ -43,13 +43,13 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
-import requests
-
 from core import (
     EXIT_API_ERROR,
     EXIT_OK,
     SCRIPT_DIR,
     build_headers,
+    claimyshare_get,
+    claimyshare_post,
     load_accounts,
     make_logger,
 )
@@ -226,13 +226,21 @@ def _fmt_reward(parsed: dict | None) -> str:
 
 
 def fetch_tasks(bearer: str, cookie: str) -> list[dict]:
-    """GET /api/tasks for one account. Raises on network / non-200."""
-    resp = requests.get(
+    """GET /api/tasks for one account. Raises on network / non-200.
+
+    Routed through `core.claimyshare_get` so the request shares the same
+    Chrome-120 TLS fingerprint as monitor.py / withdraw.py.
+    """
+    resp = claimyshare_get(
         TASKS_LIST_URL,
         headers=_tasks_headers(bearer, cookie),
         timeout=HTTP_TIMEOUT_SEC,
     )
-    resp.raise_for_status()
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"GET /api/tasks failed: status={resp.status_code} "
+            f"body={resp.text[:200]!r}"
+        )
     data = resp.json()
     # Some APIs wrap the list under a key; be lenient.
     if isinstance(data, list):
@@ -248,16 +256,20 @@ def fetch_tasks(bearer: str, cookie: str) -> list[dict]:
 def complete_task(
     bearer: str, cookie: str, task_id: int
 ) -> tuple[int, dict | None]:
-    """POST /api/tasks/complete with {taskId}. Returns (status, parsed_body)."""
+    """POST /api/tasks/complete with {taskId}. Returns (status, parsed_body).
+
+    Uses `core.claimyshare_post` for TLS-impersonated traffic, falling back
+    to plain `requests` if curl_cffi is unavailable.
+    """
     body = {"taskId": task_id}
     try:
-        resp = requests.post(
+        resp = claimyshare_post(
             TASKS_COMPLETE_URL,
             headers=_tasks_headers(bearer, cookie),
             json=body,
             timeout=HTTP_TIMEOUT_SEC,
         )
-    except requests.RequestException as e:
+    except Exception as e:  # noqa: BLE001 - requests/curl_cffi siblings
         return 0, {"error": f"network: {e}"}
     try:
         parsed = resp.json()

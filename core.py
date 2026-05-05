@@ -555,11 +555,13 @@ def _strip_owned_headers(headers: dict) -> dict:
     return out
 
 
-def _claimyshare_get(url: str, *, headers: dict, timeout: int) -> Any:
+def claimyshare_get(url: str, *, headers: dict, timeout: int) -> Any:
     """GET against claimyshare with TLS impersonation when available.
 
     Returns a response object that quacks like requests.Response (has
-    `.status_code`, `.headers`, `.json()`, `.text`).
+    `.status_code`, `.headers`, `.json()`, `.text`). Use this for ANY
+    claimyshare.io endpoint so the WAF dodge stays consistent across
+    monitor.py / withdraw.py / tasks.py.
     """
     if _TLS_IMPERSONATION_AVAILABLE and _cffi_requests is not None:
         return _cffi_requests.get(
@@ -571,7 +573,7 @@ def _claimyshare_get(url: str, *, headers: dict, timeout: int) -> Any:
     return requests.get(url, headers=headers, timeout=timeout)
 
 
-def _claimyshare_post(url: str, *, headers: dict, json: dict, timeout: int) -> Any:
+def claimyshare_post(url: str, *, headers: dict, json: dict, timeout: int) -> Any:
     """POST against claimyshare with TLS impersonation when available."""
     if _TLS_IMPERSONATION_AVAILABLE and _cffi_requests is not None:
         return _cffi_requests.post(
@@ -598,7 +600,7 @@ def fetch_claimable_balance(cfg: dict, log: Logger) -> float | None:
     headers["referer"] = "https://claimyshare.io/"
 
     try:
-        resp = _claimyshare_get(USER_API_URL, headers=headers, timeout=15)
+        resp = claimyshare_get(USER_API_URL, headers=headers, timeout=15)
     except Exception as e:  # noqa: BLE001 - both requests & curl_cffi raise here
         log(f"[{name}] [balance] network error: {e}")
         return None
@@ -696,7 +698,7 @@ def attempt_withdraw(
         attempt_num += 1
 
         try:
-            resp = _claimyshare_post(
+            resp = claimyshare_post(
                 API_URL, headers=headers, json=body, timeout=30
             )
         except Exception as e:  # noqa: BLE001 - requests/curl_cffi siblings
