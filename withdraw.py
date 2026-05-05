@@ -39,7 +39,7 @@ from core import (
 # Avoid a circular import: monitor.py imports withdraw-adjacent helpers from
 # core, but its balance-cache reader is what we want for smart-filter so we
 # pull only that symbol here. monitor.py itself does NOT import withdraw.py.
-from monitor import load_balance_cache_snapshot
+from monitor import load_balance_cache_snapshot, PRIORITY_ACCOUNTS
 
 # Parallel firing: send all account POSTs concurrently. Set False to fall
 # back to a sequential loop with INTER_ACCOUNT_SPACING_SEC between requests.
@@ -194,9 +194,19 @@ def _build_plan(
             cache_misses += 1
         plan.append((acc, override))
 
-    def _priority_key(item: tuple[dict, float | None]) -> float:
-        _acc, override = item
-        return -(override if override is not None else -1.0)
+    # Priority order (same rules as monitor.py):
+    #   1. PRIORITY_ACCOUNTS (imported from monitor.py) fire first, in
+    #      the order listed.
+    #   2. Then biggest-balance accounts.
+    #   3. Unknown-balance entries (override is None) go last (live-fetch
+    #      pays a 0-17s rate-limit tax on /api/user).
+    def _priority_key(item: tuple[dict, float | None]) -> tuple[int, float]:
+        acc, override = item
+        name = acc.get("name", "")
+        if name in PRIORITY_ACCOUNTS:
+            return (0, float(PRIORITY_ACCOUNTS.index(name)))
+        bal = override if override is not None else -1.0
+        return (1, -bal)
 
     plan.sort(key=_priority_key)
 
@@ -212,10 +222,13 @@ def _run_parallel(accounts: list[dict], log) -> list[int]:
 
     stagger = max(PARALLEL_STAGGER_MS, 0) / 1000.0
     total_dispatch = stagger * (len(plan) - 1)
-    top_previews = [
-        f"{acc['name']}({ov:.4f})" for acc, ov in plan[:5]
-        if ov is not None
-    ]
+    # Show first 5 of the plan (so priority accounts are visible even
+    # with zero/unknown balance). "*" prefix marks priority entries.
+    top_previews = []
+    for acc, ov in plan[:5]:
+        marker = "*" if acc["name"] in PRIORITY_ACCOUNTS else ""
+        ov_str = f"{ov:.4f}" if ov is not None else "?"
+        top_previews.append(f"{marker}{acc['name']}({ov_str})")
     log(
         f"[parallel] firing {len(plan)} account(s) "
         f"(max workers={MAX_PARALLEL_WORKERS}, "

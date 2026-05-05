@@ -67,6 +67,13 @@ from core import (
 # you see "rate-limited" or "503" entries from the Solana RPC layer.
 POLL_INTERVAL_SEC = 1                    # how often we check the hot wallet balance
 TOPUP_THRESHOLD_LAMPORTS = 100_000_000   # 0.1 SOL — only fire on real admin refills
+
+# Accounts that should ALWAYS fire first regardless of balance, in the order
+# listed. Put your "most important to claim no matter what" accounts here.
+# Leave empty tuple () to revert to pure balance-DESC ordering. These fire
+# even before the biggest-balance account, at positions 0, 1, 2, ... of the
+# plan list.
+PRIORITY_ACCOUNTS: tuple[str, ...] = ("daffa14",)
 # Per-account spacing between attempts from the SAME account across different
 # topup events. Aligned with withdraw.py's INTER_ACCOUNT_SPACING_SEC (5s);
 # core.py's 429 retry logic absorbs any burst that exceeds the site's
@@ -601,22 +608,36 @@ def _process_topup_parallel(
         log(f"[parallel] no accounts to fire (cache hits={hits} misses={misses} dust-skip={dust}).")
         return
 
-    # Priority order: fire biggest-balance accounts FIRST so they claim
-    # before the hot wallet drains under competition. Unknown-balance
-    # entries (override is None -> live fetch) go last because they also
-    # pay a 0-17s rate-limit retry tax on the first /api/user call.
-    def _priority_key(item: tuple[dict, Optional[float]]) -> float:
-        _acc, override = item
-        return -(override if override is not None else -1.0)
+    # Priority order:
+    #   1. PRIORITY_ACCOUNTS (tuple at top of file) always fire first, in
+    #      the order listed. Use for "claim this one no matter what".
+    #   2. Then biggest-balance accounts -- they're the highest reward if
+    #      the hot wallet drains mid-burst.
+    #   3. Unknown-balance entries (override is None -> live fetch) last,
+    #      because they also pay a 0-17s rate-limit retry tax on the first
+    #      /api/user call.
+    # Python sorts tuples left-to-right, so (bucket, inner) cleanly
+    # partitions without needing two passes.
+    def _priority_key(item: tuple[dict, Optional[float]]) -> tuple[int, float]:
+        acc, override = item
+        name = acc.get("name", "")
+        if name in PRIORITY_ACCOUNTS:
+            return (0, float(PRIORITY_ACCOUNTS.index(name)))
+        bal = override if override is not None else -1.0
+        return (1, -bal)
 
     plan.sort(key=_priority_key)
 
     stagger = max(PARALLEL_STAGGER_MS, 0) / 1000.0
     total_dispatch = stagger * (len(plan) - 1)
-    top_previews = [
-        f"{acc['name']}({ov:.4f})" for acc, ov in plan[:5]
-        if ov is not None
-    ]
+    # Always show first 5 of the plan so daffa14 (PRIORITY_ACCOUNTS[0])
+    # is visible even if its balance is unknown/zero. Mark priority
+    # accounts with a "*" prefix for at-a-glance verification.
+    top_previews = []
+    for acc, ov in plan[:5]:
+        marker = "*" if acc["name"] in PRIORITY_ACCOUNTS else ""
+        ov_str = f"{ov:.4f}" if ov is not None else "?"
+        top_previews.append(f"{marker}{acc['name']}({ov_str})")
     log(
         f"[parallel] firing {len(plan)} account(s) "
         f"(cache hits={hits} misses={misses} dust-skip={dust}; "
