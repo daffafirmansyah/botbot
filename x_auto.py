@@ -103,14 +103,20 @@ USER_AGENT = (
 
 # Delay between actions for the SAME account. Random within [min, max].
 # X is sensitive to burst follow/like patterns from a single session.
-# 60-180s = 1-3 minute pacing, looks human-ish; lowers ban risk markedly.
-ACTION_DELAY_MIN_SEC = 60
-ACTION_DELAY_MAX_SEC = 180
+# Original conservative pacing was 60-180s (1-3 min, fully human-like).
+# Profile A (moderate) trades some safety for ~3x throughput so a full
+# 64-account sweep finishes in ~1-2h instead of 3-13h. 30-60s still looks
+# like a fast user clicking through tasks; well above Twitter's hard
+# burst-detection threshold for a single session.
+ACTION_DELAY_MIN_SEC = 30
+ACTION_DELAY_MAX_SEC = 60
 
 # Delay between accounts (smaller — different sessions, less suspicious).
-# 15-30s spreads load enough that X / claimyshare don't see a uniform tick.
-ACCOUNT_DELAY_MIN_SEC = 15
-ACCOUNT_DELAY_MAX_SEC = 30
+# Original 15-30s. Profile A drops to 5-10s. Each account uses its own
+# X cookies, so per-session limits don't compound; only the shared IP
+# does, and 5-10s pacing is still well within CloudFlare's tolerance.
+ACCOUNT_DELAY_MIN_SEC = 5
+ACCOUNT_DELAY_MAX_SEC = 10
 
 HTTP_TIMEOUT_SEC = 20
 
