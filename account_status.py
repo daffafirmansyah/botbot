@@ -11,9 +11,17 @@ Per-account info:
 Accounts are grouped by wallet_address so you can see which wallets are
 shared (claimyshare's wallet pool, max 2 accounts per wallet by default).
 
+Balance source priority:
+  1. monitor.py's persisted cache (balance_cache.json) -- INSTANT, no
+     API hits. Used when monitor.py is running and the snapshot is
+     fresher than BALANCE_CACHE_MAX_AGE_SEC (default 10 minutes).
+  2. Live /api/user fetch with retry -- only used when the cache is
+     missing, stale, or for accounts not present in the snapshot.
+
 Usage:
-  python account_status.py                # full check (live balance + state)
-  python account_status.py --no-balance   # skip live fetch; only config+state
+  python account_status.py                # full check (cache or live)
+  python account_status.py --no-balance   # skip balance entirely
+  python account_status.py --live         # force live fetch, ignore cache
   python account_status.py --only adella,bolvi  # restrict to specific names
   python account_status.py --json         # machine-readable output
 """
@@ -27,6 +35,7 @@ from collections import defaultdict
 from typing import Optional
 
 import core
+import monitor
 
 
 # ---------------------------------------------------------------------------
@@ -207,7 +216,11 @@ def _print_summary(rows: list[dict]) -> None:
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--no-balance", action="store_true",
-                   help="skip live balance fetch (only show config + cooldown).")
+                   help="skip balance entirely (only show config + cooldown).")
+    p.add_argument("--live", action="store_true",
+                   help="force live /api/user fetch, ignore monitor.py's "
+                        "persisted cache. Slower and risks doubling "
+                        "per-IP rate limit if monitor.py is running.")
     p.add_argument("--only", default="",
                    help="comma-separated account names to restrict to.")
     p.add_argument("--json", action="store_true",
@@ -223,13 +236,38 @@ def main() -> int:
         if not accounts:
             sys.exit(f"[error] no accounts matched --only={args.only}")
 
+    # Try to use monitor.py's persisted cache first. This is what makes
+    # account_status.py safe to run while monitor.py is also running:
+    # we read from disk instead of double-bursting /api/user.
+    snapshot: dict[str, tuple] = {}
+    snapshot_age: float = 0.0
+    if not args.no_balance and not args.live:
+        snap = monitor.load_balance_cache_snapshot()
+        if snap:
+            snapshot = snap
+            # Compute approximate age from the freshest entry.
+            now = time.time()
+            ages = [now - ts for _, ts in snap.values() if ts > 0]
+            snapshot_age = min(ages) if ages else 0.0
+
     rows: list[dict] = []
     skip_fetch = args.no_balance
+    cache_hits = 0
+    live_fetches = 0
 
     if not skip_fetch and not args.json:
-        print(f"# fetching balance for {len(accounts)} account(s) "
-              f"({SPACING_SEC}s spacing -> ~{len(accounts) * SPACING_SEC:.0f}s)...",
-              flush=True)
+        if snapshot:
+            print(f"# using monitor.py cache snapshot "
+                  f"(freshest entry {snapshot_age:.0f}s ago, {len(snapshot)} entries)",
+                  flush=True)
+        elif args.live:
+            print(f"# forced live fetch for {len(accounts)} account(s) "
+                  f"({SPACING_SEC}s spacing -> ~{len(accounts) * SPACING_SEC:.0f}s)...",
+                  flush=True)
+        else:
+            print(f"# no cache snapshot found, falling back to live fetch "
+                  f"({SPACING_SEC}s spacing -> ~{len(accounts) * SPACING_SEC:.0f}s)...",
+                  flush=True)
 
     for i, acc in enumerate(accounts):
         name = acc["name"]
@@ -239,9 +277,24 @@ def main() -> int:
         if skip_fetch:
             balance, status = None, "SKIPPED"
         else:
-            balance, status = _fetch_one(acc)
-            if i < len(accounts) - 1:
-                time.sleep(SPACING_SEC)
+            # Cache lookup first.
+            entry = snapshot.get(name) if snapshot else None
+            if entry is not None:
+                cached_balance, _cached_ts = entry
+                if cached_balance is None:
+                    # Cache says this account previously failed to fetch.
+                    # Don't make our own life worse with another live hit.
+                    balance, status = None, "CACHE-MISS"
+                else:
+                    balance, status = float(cached_balance), "OK"
+                cache_hits += 1
+            else:
+                # Live fetch fallback for accounts not in snapshot.
+                balance, status = _fetch_one(acc)
+                live_fetches += 1
+                # Only sleep when we actually hit the API.
+                if live_fetches < len(accounts):
+                    time.sleep(SPACING_SEC)
 
         rows.append({
             "name": name,
@@ -257,6 +310,9 @@ def main() -> int:
             mark = "OK" if status == "OK" else status
             print(f"  [{i+1:3d}/{len(accounts)}] {name:20s} bal={bal_s} {mark}",
                   flush=True)
+
+    if not args.json and not skip_fetch:
+        print(f"# balance source: cache_hits={cache_hits} live_fetches={live_fetches}")
 
     if args.json:
         print(json.dumps({

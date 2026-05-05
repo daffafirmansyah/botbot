@@ -24,11 +24,13 @@ Ctrl+C stops cleanly.
 from __future__ import annotations
 
 import argparse
+import json
 import signal
 import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from typing import Optional
 
 from core import (
@@ -110,6 +112,11 @@ BALANCE_CACHE_MAX_AGE_SEC = 600.0    # use cached value if fetched within last 1
 # How long after startup we wait before declaring the cache "ready". Until
 # this point a top-up is allowed to fall back to live-fetch on cache miss.
 BALANCE_CACHE_WARMUP_SEC = 90.0
+# Persisted cache snapshot. Other tools (account_status.py) read this file
+# instead of hitting /api/user themselves, so a status check while the bot
+# is running doesn't double-burst the IP rate limit. Written after every
+# full sweep of the refresher.
+BALANCE_CACHE_SNAPSHOT_PATH = Path(__file__).resolve().parent / "balance_cache.json"
 
 _stop = False
 
@@ -176,6 +183,65 @@ class BalanceCache:
                 "oldest_age": max(ages) if ages else 0.0,
             }
 
+    def snapshot(self) -> dict:
+        """Return a JSON-serializable snapshot of the whole cache.
+
+        Used by save_to_disk; readers in other processes call back through
+        the same shape (see load_balance_cache_snapshot below).
+        """
+        with self._lock:
+            return {
+                "saved_at": time.time(),
+                "entries": {
+                    name: {"balance": balance, "fetched_at": ts}
+                    for name, (balance, ts) in self._cache.items()
+                },
+            }
+
+    def save_to_disk(self, path: Path) -> None:
+        """Write a snapshot to disk so other tools can read it without
+        hitting /api/user themselves. Writes to a tmp file then renames
+        atomically so a concurrent reader never sees a half-written file.
+        """
+        try:
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text(
+                json.dumps(self.snapshot(), separators=(",", ":")),
+                encoding="utf-8",
+            )
+            tmp.replace(path)
+        except Exception:  # noqa: BLE001 - best-effort, never block the bot
+            pass
+
+
+def load_balance_cache_snapshot(
+    path: Path = BALANCE_CACHE_SNAPSHOT_PATH,
+    max_age_sec: float = BALANCE_CACHE_MAX_AGE_SEC,
+) -> Optional[dict[str, tuple[Optional[float], float]]]:
+    """Read a balance-cache snapshot written by a monitor.py instance.
+
+    Returns a {name: (balance, fetched_at)} dict suitable for direct use,
+    or None if the file is missing, malformed, or older than max_age_sec.
+    Per-entry freshness is checked by the consumer.
+    """
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return None
+    saved_at = float(data.get("saved_at") or 0.0)
+    if saved_at <= 0 or (time.time() - saved_at) > max_age_sec:
+        return None
+    out: dict[str, tuple[Optional[float], float]] = {}
+    for name, entry in (data.get("entries") or {}).items():
+        if not isinstance(entry, dict):
+            continue
+        balance = entry.get("balance")
+        ts = float(entry.get("fetched_at") or 0.0)
+        out[name] = (balance, ts)
+    return out
+
 
 def _balance_refresher_loop(
     accounts: list[dict], cache: BalanceCache, log
@@ -213,6 +279,9 @@ def _balance_refresher_loop(
         # Extra rest after a full sweep.
         if _stop:
             return
+        # Persist the cache so other tools can read it without burning
+        # API quota of their own.
+        cache.save_to_disk(BALANCE_CACHE_SNAPSHOT_PATH)
         stats = cache.stats()
         log(
             f"[balance-cache] full sweep done | size={stats['size']} "
