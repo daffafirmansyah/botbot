@@ -44,9 +44,11 @@ from monitor import load_balance_cache_snapshot
 # Parallel firing: send all account POSTs concurrently. Set False to fall
 # back to a sequential loop with INTER_ACCOUNT_SPACING_SEC between requests.
 PARALLEL_FIRE = True
-# Matches monitor.py so manual retries can saturate the hot wallet as
-# aggressively as the auto-snipe path.
-MAX_PARALLEL_WORKERS = 32
+# Bumped from 32 -> 64 when the proxy pool went live (monitor.py uses 64
+# too for the same reason): 64 concurrent requests spread across 10 exit
+# IPs is only ~6-7 in-flight per IP, so CloudFlare sees normal traffic.
+# If you ever drop the proxy pool, dial this back down to match.
+MAX_PARALLEL_WORKERS = 64
 # Stagger the parallel dispatch so account #N waits N * PARALLEL_STAGGER_MS
 # before its first request fires. 0 = pure burst (all reqs in same ms,
 # maximum sniping speed but high 429-storm risk — relies on aggressive retry

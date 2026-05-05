@@ -78,7 +78,12 @@ PER_ACCOUNT_SPACING_SEC = 5
 # them. Drastically increases hit rate when hot wallet drains fast.
 # Trade-off: makes the burst pattern from one IP more visible to WAF.
 PARALLEL_FIRE = True
-MAX_PARALLEL_WORKERS = 32            # cap concurrent in-flight POSTs
+# Bumped from 32 -> 64 once the 10-proxy pool went live: 64 concurrent
+# requests split across 10 exit IPs is only ~6-7 in-flight per IP, which
+# looks like normal residential browsing to CloudFlare. Without the proxy
+# pool, 64 from one IP would guarantee a 429 storm -- drop this back to
+# 32 (or lower) if proxies.json is ever empty so the bot stays gentle.
+MAX_PARALLEL_WORKERS = 64            # cap concurrent in-flight POSTs
 # Stagger the parallel dispatch so account #N waits N * PARALLEL_STAGGER_MS
 # before its first request fires. 0 = pure burst (all reqs in same ms,
 # maximum sniping speed but high 429-storm risk — relies on aggressive retry
