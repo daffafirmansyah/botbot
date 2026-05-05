@@ -134,6 +134,15 @@ _THROTTLED_KEYWORDS = (
     "try again in a few",
     "too many requests",
 )
+# Backend admits its X-verification integration is down. The message says
+# "will be resolved within 24 hours" — retrying inside the same run is
+# pointless. Match these keywords to short-circuit the retry loop and tell
+# the user to come back later.
+_SERVICE_DOWN_KEYWORDS = (
+    "verification is temporarily unavailable",
+    "verification temporarily unavailable",
+    "issue will be resolved",
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -184,6 +193,10 @@ def _classify_response(status: int, body: dict | None) -> str:
         return "need-like"
     if any(k in msg for k in _ALREADY_DONE_KEYWORDS):
         return "already-done"
+    # Service-down has to be checked BEFORE the generic throttled bucket;
+    # its message also contains "try again later".
+    if any(k in msg for k in _SERVICE_DOWN_KEYWORDS):
+        return "service-down"
     if status == 429 or any(k in msg for k in _THROTTLED_KEYWORDS):
         return "throttled"
     return "error"
@@ -375,6 +388,7 @@ def process_account(acc: dict, log, dry_run: bool) -> dict:
         "need_like": 0,
         "already_done": 0,
         "throttled": 0,
+        "service_down": 0,
         "error": 0,
         "skipped_other": 0,
         "reward_sol": 0.0,
@@ -456,14 +470,14 @@ def process_account(acc: dict, log, dry_run: bool) -> dict:
             result["already_done"] += 1
             log(f"[{name}] [already-done] task {tid} '{title}' (server says claimed before)")
 
-        elif outcome == "throttled":
-            result["throttled"] += 1
-            # The server can't confirm right now (verification down, still
-            # syncing, soft rate limit). For an eligible follow/like task
-            # the action we need is determined by the title, NOT by the
-            # server's reply, so queue it for x_auto.py anyway. Doing the
-            # follow on X side is correct regardless; if we already follow,
-            # X returns 158/160 ("already") and x_auto handles that.
+        elif outcome in ("throttled", "service-down"):
+            # Both "throttled" (transient rate limit / sync) and "service-down"
+            # (backend's X verification is broken, ~24h ETA) are server-side
+            # conditions we can't unblock from here. Strategy in both cases:
+            # derive the action type from the task title and queue it so the
+            # user's next run can retry the claim once the server is healthy.
+            counter_key = "throttled" if outcome == "throttled" else "service_down"
+            result[counter_key] += 1
             title_lower = str(title).lower()
             if title_lower.startswith("follow"):
                 spec_outcome = "need-follow"
@@ -473,20 +487,22 @@ def process_account(acc: dict, log, dry_run: bool) -> dict:
                 spec_outcome = None
 
             entry = _build_pending_entry(task, spec_outcome) if spec_outcome else None
+            server_msg = ""
+            if isinstance(body, dict):
+                server_msg = str(body.get("message") or body.get("error") or "")[:120]
+
             if entry:
                 result["pending_x"].append(entry)
                 kind = "follow" if spec_outcome == "need-follow" else "like"
-                server_msg = ""
-                if isinstance(body, dict):
-                    server_msg = str(body.get("message") or body.get("error") or "")[:80]
+                tag = outcome  # "throttled" or "service-down"
                 log(
-                    f"[{name}] [throttled] task {tid} '{title}' — server: "
+                    f"[{name}] [{tag}] task {tid} '{title}' — server: "
                     f"{server_msg!r}. Queued {kind} {entry['target']} for X "
-                    "action anyway (claim will retry on next run)."
+                    "action; claim will retry on next run."
                 )
             else:
                 log(
-                    f"[{name}] [throttled] task {tid} '{title}' "
+                    f"[{name}] [{outcome}] task {tid} '{title}' "
                     f"status={status} body={body} — re-run later."
                 )
 

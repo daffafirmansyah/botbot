@@ -325,7 +325,10 @@ def try_auto_claim(
       "already-done" -> server says already claimed
       "need-follow"  -> server still doesn't see our follow (keep action pending)
       "need-like"    -> server still doesn't see our like  (keep action pending)
-      "throttled"    -> gave up after max retries
+      "throttled"    -> gave up after max retries (transient rate limit)
+      "service-down" -> backend's X verification is broken (~24h ETA);
+                        retrying inside the same run is futile, action is
+                        kept pending for the next run
       "error"        -> HTTP / network / unknown response
       "skip"         -> missing task_id, nothing to claim
     """
@@ -367,14 +370,35 @@ def try_auto_claim(
                 "Keeping action pending for next run.")
             return outcome
         if outcome == "throttled":
+            server_msg = ""
+            if isinstance(body, dict):
+                server_msg = str(body.get("message") or body.get("error") or "")[:120]
             if attempt <= AUTO_CLAIM_MAX_RETRIES:
                 backoff = AUTO_CLAIM_RETRY_WAITS_SEC[attempt - 1]
-                log(f"[{name}] [auto-claim] throttled; waiting {backoff}s "
-                    f"(attempt {attempt}/{AUTO_CLAIM_MAX_RETRIES})...")
+                log(
+                    f"[{name}] [auto-claim] throttled (server: {server_msg!r}); "
+                    f"waiting {backoff}s (attempt {attempt}/{AUTO_CLAIM_MAX_RETRIES})..."
+                )
                 time.sleep(backoff)
                 continue
-            log(f"[{name}] [auto-claim] throttled, giving up on task {task_id}.")
+            log(
+                f"[{name}] [auto-claim] throttled (server: {server_msg!r}), "
+                f"giving up on task {task_id}."
+            )
             return "throttled"
+        if outcome == "service-down":
+            # Backend says X verification is unavailable for ~24h. There is
+            # no point spending retry budget on this in the same run. Action
+            # stays in pending_x.json for the user to re-run later.
+            server_msg = ""
+            if isinstance(body, dict):
+                server_msg = str(body.get("message") or body.get("error") or "")[:160]
+            log(
+                f"[{name}] [auto-claim] [service-down] task {task_id}: "
+                f"{server_msg!r}. Backend says ~24h ETA; not retrying this "
+                "run. Action kept pending — re-run `python x_auto.py` later."
+            )
+            return "service-down"
         # error / unknown
         log(f"[{name}] [auto-claim] [error] task {task_id}: status={status} body={body}")
         return "error"
@@ -640,10 +664,10 @@ def process_account(
                 elif claim_outcome == "skip":
                     stats["claim_skip"] += 1
                 else:
-                    # need-follow/need-like/throttled/error: X action was
-                    # real but claim didn't stick. Put action back in
-                    # pending so the next run can retry the claim (no need
-                    # to redo the X side — it's already done).
+                    # need-follow/need-like/throttled/service-down/error:
+                    # X action was real but claim didn't stick. Put action
+                    # back in pending so the next run can retry the claim
+                    # (no need to redo the X side — it's already done).
                     stats["claim_fail"] += 1
                     if action not in still_pending:
                         still_pending.append(action)
