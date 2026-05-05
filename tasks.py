@@ -80,12 +80,25 @@ HTTP_TIMEOUT_SEC = 20
 
 # Retry policy for `fetch_tasks` when claimyshare returns 429 / 5xx. The
 # discovery step is the gate to everything else, so giving up on the first
-# rate-limit hit aborts the whole account. Mirrors the retry shape used in
-# core.attempt_withdraw, but with finite retries because we do NOT want to
-# block the caller indefinitely on a read.
-FETCH_TASKS_MAX_RETRIES = 5
-FETCH_TASKS_RETRY_BASE_SEC = 3
-FETCH_TASKS_RETRY_MAX_SEC = 8
+# rate-limit hit aborts the whole account.
+#
+# claimyshare's per-JWT limit is 3 req / 60s. If we retry too fast we keep
+# refreshing the sliding window and never escape. Wait times grow
+# progressively so attempts 4 and 5 fall AFTER a full 60s cooldown,
+# guaranteeing the rate window has reset:
+#
+#   attempt 1 wait =  8s   (fast for transient hiccups)
+#   attempt 2 wait = 15s
+#   attempt 3 wait = 30s   (~half a window)
+#   attempt 4 wait = 60s   (full window guaranteed reset)
+#   attempt 5 wait = 90s   (window + safety margin)
+#
+# Server-provided Retry-After is honored only when it's LARGER than the
+# progressive wait (e.g., server says 120s) and capped at 180s so a buggy
+# server header can't pin us indefinitely.
+FETCH_TASKS_RETRY_WAITS_SEC = (8, 15, 30, 60, 90)
+FETCH_TASKS_MAX_RETRIES = len(FETCH_TASKS_RETRY_WAITS_SEC)
+FETCH_TASKS_RETRY_AFTER_CAP_SEC = 180
 
 # Parallel mode: fire multiple accounts at once. Each account still walks
 # its own task list sequentially with TASK_INTER_DELAY_SEC between tasks.
@@ -283,18 +296,22 @@ def fetch_tasks(
         if not retryable or attempt > FETCH_TASKS_MAX_RETRIES:
             break
 
-        # Honor Retry-After if the server provides a small one; otherwise
-        # use a short cap so we don't sit idle.
+        # Progressive backoff. Server Retry-After only wins if larger than
+        # our progressive base (capped at FETCH_TASKS_RETRY_AFTER_CAP_SEC).
+        progressive_wait = FETCH_TASKS_RETRY_WAITS_SEC[attempt - 1]
         retry_after_raw = ""
         try:
             retry_after_raw = resp.headers.get("retry-after", "") or ""
         except Exception:  # noqa: BLE001
             pass
         try:
-            retry_after = int(retry_after_raw) if retry_after_raw else FETCH_TASKS_RETRY_BASE_SEC
+            server_hint = int(retry_after_raw) if retry_after_raw else 0
         except (TypeError, ValueError):
-            retry_after = FETCH_TASKS_RETRY_BASE_SEC
-        wait = min(max(retry_after, 1), FETCH_TASKS_RETRY_MAX_SEC)
+            server_hint = 0
+        wait = min(
+            max(progressive_wait, server_hint),
+            FETCH_TASKS_RETRY_AFTER_CAP_SEC,
+        )
 
         if log is not None:
             log(
