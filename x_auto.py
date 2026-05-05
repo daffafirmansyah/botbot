@@ -713,12 +713,26 @@ def main() -> int:
     auto_claim = not args.skip_claim
 
     if args.discover:
-        accounts_pending, _disc_stats = discover_pending(
+        accounts_pending, disc_stats = discover_pending(
             log, only_name=args.name, dry_run=args.dry_run
         )
         if not accounts_pending:
-            log("[discover] no accounts have follow/like tasks pending. "
-                "Nothing to do for the X side.")
+            errors = int(disc_stats.get("error", 0))
+            throttled = int(disc_stats.get("throttled", 0))
+            if errors or throttled:
+                # Distinguish "genuinely nothing pending" from "discovery
+                # itself failed" so the user doesn't assume the queue is
+                # empty when really we never managed to read it.
+                log(
+                    "[discover] discovery did NOT complete cleanly: "
+                    f"errors={errors} throttled={throttled}. The pending "
+                    "list could not be built. Wait for the rate-limit "
+                    "window to clear (or stop monitor.py briefly) and "
+                    "re-run `python x_auto.py --discover`."
+                )
+                return EXIT_API_ERROR
+            log("[discover] all accounts checked; none have follow/like "
+                "tasks pending right now. Nothing to do for the X side.")
             return EXIT_OK
     else:
         pending = load_pending()
