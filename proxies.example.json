@@ -1,0 +1,8 @@
+{
+  "_description": "Copy this file to proxies.json and fill in your own proxy credentials. The real proxies.json is gitignored so creds never get pushed. Each entry is Webshare's native 'host:port:user:password' format; core.load_proxies() parses it into http://user:pass@host:port. Each account gets a stable-hash-assigned proxy at startup. Leaving this list empty or deleting proxies.json is fine -- the bot falls back to direct connection from your VPS IP.",
+  "proxies": [
+    "host1.example.com:6754:yourusername:yourpassword",
+    "host2.example.com:6755:yourusername:yourpassword",
+    "host3.example.com:6756:yourusername:yourpassword"
+  ]
+}

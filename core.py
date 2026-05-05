@@ -84,6 +84,7 @@ HOT_WALLET = "8MrX8pJ6VkCsmMjrn4jTrp9DFACrytKVz6T23vDpqGgy"
 SCRIPT_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = SCRIPT_DIR / "config.json"
 STATE_PATH = SCRIPT_DIR / "state.json"
+PROXIES_PATH = SCRIPT_DIR / "proxies.json"
 
 # Exit codes (used by withdraw.py; monitor.py uses them internally).
 EXIT_OK = 0
@@ -511,6 +512,97 @@ def save_state(state: dict) -> None:
 # HTTP
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Proxy pool support
+# ---------------------------------------------------------------------------
+#
+# Distribute the 64 accounts across N proxy IPs so CloudFlare never sees more
+# than (64 / N) concurrent requests from any single IP. Assignment is a
+# stable hash of the account name so each account keeps the same exit IP
+# between runs; that avoids the "session detected from new IP" class of
+# auth/captcha re-challenges some sites throw.
+#
+# proxies.json format: {"proxies": ["host:port:user:password", ...]}
+# (Webshare's native export format; we parse it into full URLs on load.)
+#
+# If proxies.json is missing, unreadable, or has an empty list, every
+# account falls back to direct connection (the original behaviour) and the
+# bot keeps working.
+
+
+def _parse_proxy_line(raw: str) -> Optional[str]:
+    """Turn 'host:port:user:password' into 'http://user:password@host:port'.
+
+    Accepts already-formatted http:// URLs too (pass-through). Returns None
+    on malformed input so a single bad line doesn't kill the pool.
+    """
+    raw = raw.strip()
+    if not raw:
+        return None
+    if raw.startswith("http://") or raw.startswith("https://") or raw.startswith("socks5://"):
+        return raw
+    parts = raw.split(":")
+    if len(parts) != 4:
+        return None
+    host, port, user, password = parts
+    return f"http://{user}:{password}@{host}:{port}"
+
+
+_PROXY_CACHE: Optional[list[str]] = None
+_PROXY_CACHE_LOCK = threading.Lock()
+
+
+def load_proxies(path: Path = PROXIES_PATH) -> list[str]:
+    """Read proxies.json once and cache. Returns empty list if unavailable.
+
+    Safe to call from hot paths -- after the first read we just return the
+    cached list, no disk I/O.
+    """
+    global _PROXY_CACHE
+    with _PROXY_CACHE_LOCK:
+        if _PROXY_CACHE is not None:
+            return _PROXY_CACHE
+        if not path.exists():
+            _PROXY_CACHE = []
+            return _PROXY_CACHE
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            raw_list = data.get("proxies") or []
+        except Exception:  # noqa: BLE001
+            _PROXY_CACHE = []
+            return _PROXY_CACHE
+        urls = [u for u in (_parse_proxy_line(r) for r in raw_list) if u]
+        _PROXY_CACHE = urls
+        return _PROXY_CACHE
+
+
+def get_proxy_for_account(account_name: str) -> Optional[str]:
+    """Stable-hash assignment of account -> proxy URL.
+
+    Same account always maps to the same proxy as long as the pool size
+    doesn't change. Returns None if the pool is empty (direct-connect).
+    Uses zlib.crc32 rather than hash() because Python's hash() is salted
+    per-process and would scramble the mapping across bot restarts --
+    we want stability across restarts so account state / rate-limit
+    history on the proxy's IP carries over.
+    """
+    pool = load_proxies()
+    if not pool:
+        return None
+    import zlib
+    idx = zlib.crc32(account_name.encode("utf-8")) % len(pool)
+    return pool[idx]
+
+
+def _proxies_dict(proxy_url: Optional[str]) -> Optional[dict]:
+    """Convert a single proxy URL into the {http, https} dict curl_cffi /
+    requests both accept, or None if no proxy.
+    """
+    if not proxy_url:
+        return None
+    return {"http": proxy_url, "https": proxy_url}
+
+
 def build_headers(bearer: str, cookie: str) -> dict:
     return {
         "accept": "*/*",
@@ -564,35 +656,58 @@ def _strip_owned_headers(headers: dict) -> dict:
     return out
 
 
-def claimyshare_get(url: str, *, headers: dict, timeout: int) -> Any:
-    """GET against claimyshare with TLS impersonation when available.
+def claimyshare_get(
+    url: str, *, headers: dict, timeout: int, proxy: Optional[str] = None
+) -> Any:
+    """GET against claimyshare with TLS impersonation + optional per-account
+    proxy.
 
     Returns a response object that quacks like requests.Response (has
     `.status_code`, `.headers`, `.json()`, `.text`). Use this for ANY
     claimyshare.io endpoint so the WAF dodge stays consistent across
     monitor.py / withdraw.py / tasks.py.
     """
+    proxies = _proxies_dict(proxy)
     if _TLS_IMPERSONATION_AVAILABLE and _cffi_requests is not None:
-        return _cffi_requests.get(
-            url,
+        kwargs = dict(
             headers=_strip_owned_headers(headers),
             timeout=timeout,
             impersonate=IMPERSONATE_PROFILE,
         )
-    return requests.get(url, headers=headers, timeout=timeout)
+        if proxies:
+            kwargs["proxies"] = proxies
+        return _cffi_requests.get(url, **kwargs)
+    kwargs = dict(headers=headers, timeout=timeout)
+    if proxies:
+        kwargs["proxies"] = proxies
+    return requests.get(url, **kwargs)
 
 
-def claimyshare_post(url: str, *, headers: dict, json: dict, timeout: int) -> Any:
-    """POST against claimyshare with TLS impersonation when available."""
+def claimyshare_post(
+    url: str,
+    *,
+    headers: dict,
+    json: dict,
+    timeout: int,
+    proxy: Optional[str] = None,
+) -> Any:
+    """POST against claimyshare with TLS impersonation + optional per-account
+    proxy."""
+    proxies = _proxies_dict(proxy)
     if _TLS_IMPERSONATION_AVAILABLE and _cffi_requests is not None:
-        return _cffi_requests.post(
-            url,
+        kwargs = dict(
             headers=_strip_owned_headers(headers),
             json=json,
             timeout=timeout,
             impersonate=IMPERSONATE_PROFILE,
         )
-    return requests.post(url, headers=headers, json=json, timeout=timeout)
+        if proxies:
+            kwargs["proxies"] = proxies
+        return _cffi_requests.post(url, **kwargs)
+    kwargs = dict(headers=headers, json=json, timeout=timeout)
+    if proxies:
+        kwargs["proxies"] = proxies
+    return requests.post(url, **kwargs)
 
 
 # Retry budget for fetch_claimable_balance. This call sits on the hot path
@@ -632,13 +747,19 @@ def fetch_claimable_balance(
     headers = build_headers(cfg["bearer_token"], cfg["cookie"])
     # Balance fetch is a read from the app root, not the /withdraw page.
     headers["referer"] = "https://claimyshare.io/"
+    # Route through this account's assigned exit IP so the per-IP
+    # rate-limit at CloudFlare sees (64 / N) concurrent requests from
+    # each IP instead of 64 from one. No-op when proxies.json is empty.
+    proxy = get_proxy_for_account(name)
 
     max_retries = 0 if single_attempt else BALANCE_FETCH_MAX_RETRIES
 
     last_status = 0
     for attempt in range(1, max_retries + 2):  # initial + retries
         try:
-            resp = claimyshare_get(USER_API_URL, headers=headers, timeout=15)
+            resp = claimyshare_get(
+                USER_API_URL, headers=headers, timeout=15, proxy=proxy
+            )
         except Exception as e:  # noqa: BLE001 - both requests & curl_cffi raise
             log(f"[{name}] [balance] network error: {e}")
             return None
@@ -762,6 +883,9 @@ def attempt_withdraw(
 
     headers = build_headers(cfg["bearer_token"], cfg["cookie"])
     body = {"amountSol": amount, "walletAddress": wallet}
+    # Same proxy as this account's balance fetch so session state /
+    # rate-limit counters stay on a single IP per account.
+    proxy = get_proxy_for_account(name)
 
     # ----- Retry loop -----
     # 429 (per-JWT rate-limit) and 5xx (server unavailable) are transient and
@@ -776,7 +900,7 @@ def attempt_withdraw(
 
         try:
             resp = claimyshare_post(
-                API_URL, headers=headers, json=body, timeout=30
+                API_URL, headers=headers, json=body, timeout=30, proxy=proxy
             )
         except Exception as e:  # noqa: BLE001 - requests/curl_cffi siblings
             log(f"[{name}] [error] network error during POST: {e}")

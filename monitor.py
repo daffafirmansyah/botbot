@@ -819,6 +819,31 @@ def main() -> int:
         f"precache={BALANCE_PRECACHE_ENABLED}"
     )
 
+    # Proxy pool status. We report it up-front so a silent fall-back to
+    # direct-connect (e.g. proxies.json missing after a deploy) can't hide
+    # as a mystery rate-limit regression later.
+    from core import load_proxies, get_proxy_for_account
+    pool = load_proxies()
+    if pool:
+        # Show distribution: how many accounts land on each proxy slot.
+        dist: dict[int, int] = {}
+        for acc in accounts:
+            p = get_proxy_for_account(acc["name"])
+            idx = pool.index(p) if p in pool else -1
+            dist[idx] = dist.get(idx, 0) + 1
+        dist_str = ", ".join(
+            f"proxy#{k}:{v}" for k, v in sorted(dist.items())
+        )
+        log(
+            f"[proxy-pool] {len(pool)} proxy IP(s) active; "
+            f"{len(accounts)} account(s) distributed ({dist_str})."
+        )
+    else:
+        log(
+            "[proxy-pool] no proxies.json or empty list; "
+            "all accounts use direct connection from VPS IP."
+        )
+
     state = load_state()
 
     if args.reset_cooldowns:

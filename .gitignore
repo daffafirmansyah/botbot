@@ -10,6 +10,7 @@ pending_x.json
 x_accounts.json
 x_accounts.tsv
 balance_cache.json
+proxies.json
 __pycache__/
 *.pyc
 .venv/
