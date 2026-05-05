@@ -7,19 +7,27 @@ Why this exists:
   refresh expired bearer / cookie values for accounts that are already in
   config.json, you need this in-place updater instead.
 
-Behavior:
+Behavior (DEFAULT, safe):
   - Reads accounts.tsv (same format as `add_account.py --bulk`).
   - For each row whose `name` already exists in config.json, updates
-    bearer_token, cookie, wallet_address, and amount_sol IN PLACE.
+    ONLY bearer_token and cookie IN PLACE. wallet_address and amount_sol
+    are deliberately NOT touched, because those are owned by
+    assign_wallets.py and your config.json -- the TSV often carries
+    placeholder values for them.
   - Rows whose name is NOT in config.json are SKIPPED with a warning
     (use add_account.py for new accounts).
   - Writes a timestamped backup of config.json before saving.
 
+Danger flags (opt-in only when you really mean it):
+  --include-wallet : also overwrite wallet_address from the TSV.
+  --include-amount : also overwrite amount_sol from the TSV.
+
 Usage:
-  python refresh_creds.py                    # apply changes
+  python refresh_creds.py                    # apply (creds only)
   python refresh_creds.py --dry-run          # preview only, no write
   python refresh_creds.py --only adella,bolvi  # restrict to specific names
   python refresh_creds.py --tsv path/to/file.tsv   # custom TSV path
+  python refresh_creds.py --include-wallet --dry-run  # see wallet diffs
 """
 from __future__ import annotations
 
@@ -36,7 +44,12 @@ CONFIG_PATH = SCRIPT_DIR / "config.json"
 DEFAULT_TSV_PATH = SCRIPT_DIR / "accounts.tsv"
 
 REQUIRED_FIELDS = ("name", "bearer_token", "cookie", "wallet_address", "amount_sol")
-UPDATABLE_FIELDS = ("bearer_token", "cookie", "wallet_address", "amount_sol")
+# By default we ONLY refresh creds (bearer + cookie). wallet_address and
+# amount_sol are managed by assign_wallets.py / config.json and are usually
+# placeholders in the TSV, so refreshing them by default would silently
+# clobber the real wallet pool. Opt in with --include-wallet / --include-amount.
+DEFAULT_UPDATABLE_FIELDS = ("bearer_token", "cookie")
+ALL_UPDATABLE_FIELDS = ("bearer_token", "cookie", "wallet_address", "amount_sol")
 
 
 # ---------------------------------------------------------------------------
@@ -170,10 +183,13 @@ def _short(v: str, n: int = 8) -> str:
     return f"{s[:n]}..{s[-n:]}"
 
 
-def diff_account(existing: dict, fresh: dict) -> dict:
-    """Return {field: (old, new)} for fields that actually changed."""
+def diff_account(
+    existing: dict, fresh: dict, fields: tuple[str, ...]
+) -> dict:
+    """Return {field: (old, new)} for fields that actually changed,
+    restricted to the given field set."""
     changes: dict[str, tuple] = {}
-    for f in UPDATABLE_FIELDS:
+    for f in fields:
         old = existing.get(f, "")
         new_raw = fresh.get(f, "")
         if f == "amount_sol":
@@ -197,9 +213,24 @@ def main() -> int:
                    help="Preview changes without writing.")
     p.add_argument("--only", default="",
                    help="Comma-separated account names to restrict to.")
+    p.add_argument("--include-wallet", action="store_true",
+                   help="Also overwrite wallet_address from the TSV. "
+                        "DANGEROUS: most TSVs carry a placeholder wallet "
+                        "per row, which would clobber assign_wallets.py's "
+                        "pool. Only use this when you know your TSV's "
+                        "wallet_address column is authoritative.")
+    p.add_argument("--include-amount", action="store_true",
+                   help="Also overwrite amount_sol from the TSV.")
     args = p.parse_args()
 
     only_set = {n.strip() for n in args.only.split(",") if n.strip()} if args.only else None
+
+    fields = list(DEFAULT_UPDATABLE_FIELDS)
+    if args.include_wallet:
+        fields.append("wallet_address")
+    if args.include_amount:
+        fields.append("amount_sol")
+    fields_t = tuple(fields)
 
     data = _load_config()
     accounts = data.get("accounts")
@@ -211,6 +242,11 @@ def main() -> int:
 
     print(f"# config.json: {len(by_name)} account(s)")
     print(f"# tsv:          {len(rows)} row(s)")
+    print(f"# updating fields: {', '.join(fields_t)}")
+    if not args.include_wallet:
+        print("  (wallet_address NOT touched -- pass --include-wallet to override)")
+    if not args.include_amount:
+        print("  (amount_sol NOT touched -- pass --include-amount to override)")
     if only_set:
         print(f"# filtering to: {sorted(only_set)}")
     print()
@@ -229,7 +265,7 @@ def main() -> int:
         if target is None:
             missing_in_config.append(name)
             continue
-        changes = diff_account(target, row)
+        changes = diff_account(target, row, fields_t)
         if not changes:
             unchanged_names.append(name)
             continue
