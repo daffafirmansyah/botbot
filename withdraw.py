@@ -44,13 +44,17 @@ from monitor import load_balance_cache_snapshot
 # Parallel firing: send all account POSTs concurrently. Set False to fall
 # back to a sequential loop with INTER_ACCOUNT_SPACING_SEC between requests.
 PARALLEL_FIRE = True
-MAX_PARALLEL_WORKERS = 20
+# Matches monitor.py so manual retries can saturate the hot wallet as
+# aggressively as the auto-snipe path.
+MAX_PARALLEL_WORKERS = 32
 # Stagger the parallel dispatch so account #N waits N * PARALLEL_STAGGER_MS
 # before its first request fires. 0 = pure burst (all reqs in same ms,
 # maximum sniping speed but high 429-storm risk — relies on aggressive retry
 # in core.py to recover the misses). Raise to 200/500/2000 if you start
 # seeing IP-level blocks (403 / connection refused, NOT just 429).
-PARALLEL_STAGGER_MS = 0
+# 2ms mirrors monitor.py: still effectively a burst but avoids the
+# exact-same-timestamp fingerprint that some WAFs flag.
+PARALLEL_STAGGER_MS = 2
 
 # Sequential fallback only.
 INTER_ACCOUNT_SPACING_SEC = 5
@@ -129,28 +133,93 @@ def _filter_smart(
     return eligible, skipped
 
 
-def _fire_one(acc: dict, log, start_delay_sec: float = 0.0) -> int:
+def _fire_one(
+    acc: dict,
+    log,
+    start_delay_sec: float = 0.0,
+    amount_override: float | None = None,
+) -> int:
     if start_delay_sec > 0:
         time.sleep(start_delay_sec)
     log(f"[{acc['name']}] [fire] starting withdraw.")
-    exit_code, _parsed, _status = attempt_withdraw(acc, log, verify_onchain=False)
+    exit_code, _parsed, _status = attempt_withdraw(
+        acc,
+        log,
+        verify_onchain=False,
+        amount_sol_override=amount_override,
+    )
     return exit_code
 
 
-def _run_parallel(accounts: list[dict], log) -> list[int]:
-    stagger = max(PARALLEL_STAGGER_MS, 0) / 1000.0
-    total_dispatch = stagger * (len(accounts) - 1)
+def _build_plan(
+    accounts: list[dict], log
+) -> list[tuple[dict, float | None]]:
+    """
+    Build (account, amount_override) pairs from monitor.py's balance cache.
+
+    Accounts present in the cache get their balance passed through as
+    amount_sol_override so attempt_withdraw skips the live /api/user call
+    (0-17s rate-limit retry tax per account). Accounts missing from the
+    cache fall through to the live fetch path -- safer than skipping them
+    entirely when the cache is stale or incomplete.
+
+    Result is sorted by override DESC so the biggest-balance accounts
+    enter the thread pool first and are the first 32 in flight. Unknown
+    (override=None) accounts go last because they also pay live-fetch tax.
+    """
+    snapshot = load_balance_cache_snapshot()
+    balances = (snapshot or {}).get("balances") or {}
+
+    plan: list[tuple[dict, float | None]] = []
+    cache_hits = 0
+    cache_misses = 0
+    for acc in accounts:
+        name = acc["name"]
+        bal_entry = balances.get(name)
+        override: float | None = None
+        if bal_entry is not None:
+            amt = bal_entry.get("amount_sol_task")
+            if isinstance(amt, (int, float)):
+                override = float(amt)
+                cache_hits += 1
+        if override is None:
+            cache_misses += 1
+        plan.append((acc, override))
+
+    def _priority_key(item: tuple[dict, float | None]) -> float:
+        _acc, override = item
+        return -(override if override is not None else -1.0)
+
+    plan.sort(key=_priority_key)
+
     log(
-        f"[parallel] firing {len(accounts)} account(s) "
-        f"(max workers={MAX_PARALLEL_WORKERS}, "
-        f"stagger={PARALLEL_STAGGER_MS}ms => dispatch window {total_dispatch:.1f}s)."
+        f"[plan] cache hits={cache_hits} misses={cache_misses} "
+        f"(misses will live-fetch /api/user before /api/withdraw)."
     )
-    workers = min(MAX_PARALLEL_WORKERS, len(accounts))
+    return plan
+
+
+def _run_parallel(accounts: list[dict], log) -> list[int]:
+    plan = _build_plan(accounts, log)
+
+    stagger = max(PARALLEL_STAGGER_MS, 0) / 1000.0
+    total_dispatch = stagger * (len(plan) - 1)
+    top_previews = [
+        f"{acc['name']}({ov:.4f})" for acc, ov in plan[:5]
+        if ov is not None
+    ]
+    log(
+        f"[parallel] firing {len(plan)} account(s) "
+        f"(max workers={MAX_PARALLEL_WORKERS}, "
+        f"stagger={PARALLEL_STAGGER_MS}ms => dispatch window {total_dispatch:.1f}s; "
+        f"priority top5: {top_previews})."
+    )
+    workers = min(MAX_PARALLEL_WORKERS, len(plan))
     results: list[int] = []
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="wd") as ex:
         futures = [
-            ex.submit(_fire_one, acc, log, i * stagger)
-            for i, acc in enumerate(accounts)
+            ex.submit(_fire_one, acc, log, i * stagger, override)
+            for i, (acc, override) in enumerate(plan)
         ]
         for fut in as_completed(futures):
             try:
@@ -162,14 +231,16 @@ def _run_parallel(accounts: list[dict], log) -> list[int]:
 
 
 def _run_sequential(accounts: list[dict], log) -> list[int]:
+    plan = _build_plan(accounts, log)
     results: list[int] = []
-    for i, acc in enumerate(accounts):
+    for i, (acc, override) in enumerate(plan):
         log(
-            f"[{acc['name']}] attempt {i + 1}/{len(accounts)} "
-            f"| wallet={acc['wallet_address']} amount_sol={acc['amount_sol']}"
+            f"[{acc['name']}] attempt {i + 1}/{len(plan)} "
+            f"| wallet={acc['wallet_address']} "
+            f"amount={'cache=' + f'{override:.6f}' if override is not None else 'live-fetch'}"
         )
-        results.append(_fire_one(acc, log))
-        if i < len(accounts) - 1:
+        results.append(_fire_one(acc, log, amount_override=override))
+        if i < len(plan) - 1:
             time.sleep(INTER_ACCOUNT_SPACING_SEC)
     return results
 
