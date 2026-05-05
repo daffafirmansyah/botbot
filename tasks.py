@@ -275,7 +275,9 @@ def fetch_tasks(
     """
     last_status = 0
     last_body = ""
+    last_attempt = 0
     for attempt in range(1, FETCH_TASKS_MAX_RETRIES + 2):  # initial + retries
+        last_attempt = attempt
         resp = claimyshare_get(
             TASKS_LIST_URL,
             headers=_tasks_headers(bearer, cookie),
@@ -334,7 +336,7 @@ def fetch_tasks(
         time.sleep(wait)
 
     raise RuntimeError(
-        f"GET /api/tasks failed after {FETCH_TASKS_MAX_RETRIES + 1} attempt(s): "
+        f"GET /api/tasks failed after {last_attempt} attempt(s): "
         f"status={last_status} body={last_body!r}"
     )
 
