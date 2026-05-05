@@ -441,10 +441,37 @@ def process_account(acc: dict, log, dry_run: bool) -> dict:
 
         elif outcome == "throttled":
             result["throttled"] += 1
-            log(
-                f"[{name}] [throttled] task {tid} '{title}' "
-                f"status={status} body={body} — re-run later."
-            )
+            # The server can't confirm right now (verification down, still
+            # syncing, soft rate limit). For an eligible follow/like task
+            # the action we need is determined by the title, NOT by the
+            # server's reply, so queue it for x_auto.py anyway. Doing the
+            # follow on X side is correct regardless; if we already follow,
+            # X returns 158/160 ("already") and x_auto handles that.
+            title_lower = str(title).lower()
+            if title_lower.startswith("follow"):
+                spec_outcome = "need-follow"
+            elif title_lower.startswith("like"):
+                spec_outcome = "need-like"
+            else:
+                spec_outcome = None
+
+            entry = _build_pending_entry(task, spec_outcome) if spec_outcome else None
+            if entry:
+                result["pending_x"].append(entry)
+                kind = "follow" if spec_outcome == "need-follow" else "like"
+                server_msg = ""
+                if isinstance(body, dict):
+                    server_msg = str(body.get("message") or body.get("error") or "")[:80]
+                log(
+                    f"[{name}] [throttled] task {tid} '{title}' — server: "
+                    f"{server_msg!r}. Queued {kind} {entry['target']} for X "
+                    "action anyway (claim will retry on next run)."
+                )
+            else:
+                log(
+                    f"[{name}] [throttled] task {tid} '{title}' "
+                    f"status={status} body={body} — re-run later."
+                )
 
         else:  # "error"
             result["error"] += 1
