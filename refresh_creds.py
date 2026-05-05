@@ -277,10 +277,12 @@ def main() -> int:
                 print(f"   {field}: {old!r} -> {new!r}")
             else:
                 print(f"   {field}: {_short(old)} -> {_short(new)}")
+        # Track in either mode so the summary reports a truthful count.
+        # Mutation only happens outside dry-run.
+        updated_names.append(name)
         if not args.dry_run:
             for field, (_old, new) in changes.items():
                 target[field] = new
-            updated_names.append(name)
 
     # ---- Summary ----
     print()
