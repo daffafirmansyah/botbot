@@ -42,6 +42,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+from typing import Callable
 
 from core import (
     EXIT_API_ERROR,
@@ -76,6 +77,15 @@ TASK_TITLE_PREFIXES = ("follow", "like")
 
 # Per-request HTTP timeout.
 HTTP_TIMEOUT_SEC = 20
+
+# Retry policy for `fetch_tasks` when claimyshare returns 429 / 5xx. The
+# discovery step is the gate to everything else, so giving up on the first
+# rate-limit hit aborts the whole account. Mirrors the retry shape used in
+# core.attempt_withdraw, but with finite retries because we do NOT want to
+# block the caller indefinitely on a read.
+FETCH_TASKS_MAX_RETRIES = 5
+FETCH_TASKS_RETRY_BASE_SEC = 3
+FETCH_TASKS_RETRY_MAX_SEC = 8
 
 # Parallel mode: fire multiple accounts at once. Each account still walks
 # its own task list sequentially with TASK_INTER_DELAY_SEC between tasks.
@@ -225,32 +235,78 @@ def _fmt_reward(parsed: dict | None) -> str:
     return " ".join(parts) if parts else "(no reward fields)"
 
 
-def fetch_tasks(bearer: str, cookie: str) -> list[dict]:
-    """GET /api/tasks for one account. Raises on network / non-200.
+def fetch_tasks(
+    bearer: str, cookie: str, log: Callable[[str], None] | None = None
+) -> list[dict]:
+    """GET /api/tasks for one account, retrying on 429 / 5xx.
 
     Routed through `core.claimyshare_get` so the request shares the same
     Chrome-120 TLS fingerprint as monitor.py / withdraw.py.
+
+    Raises RuntimeError if every retry is exhausted with a non-2xx status,
+    or ValueError if the response is shaped unexpectedly. Network errors
+    bubble up from `claimyshare_get` as plain Exceptions.
     """
-    resp = claimyshare_get(
-        TASKS_LIST_URL,
-        headers=_tasks_headers(bearer, cookie),
-        timeout=HTTP_TIMEOUT_SEC,
-    )
-    if resp.status_code != 200:
-        raise RuntimeError(
-            f"GET /api/tasks failed: status={resp.status_code} "
-            f"body={resp.text[:200]!r}"
+    last_status = 0
+    last_body = ""
+    for attempt in range(1, FETCH_TASKS_MAX_RETRIES + 2):  # initial + retries
+        resp = claimyshare_get(
+            TASKS_LIST_URL,
+            headers=_tasks_headers(bearer, cookie),
+            timeout=HTTP_TIMEOUT_SEC,
         )
-    data = resp.json()
-    # Some APIs wrap the list under a key; be lenient.
-    if isinstance(data, list):
-        return data
-    if isinstance(data, dict):
-        for key in ("tasks", "data", "result"):
-            v = data.get(key)
-            if isinstance(v, list):
-                return v
-    raise ValueError(f"unexpected /api/tasks response shape: {type(data).__name__}")
+        status = resp.status_code
+        last_status = status
+
+        if status == 200:
+            data = resp.json()
+            if isinstance(data, list):
+                return data
+            if isinstance(data, dict):
+                for key in ("tasks", "data", "result"):
+                    v = data.get(key)
+                    if isinstance(v, list):
+                        return v
+            raise ValueError(
+                f"unexpected /api/tasks response shape: {type(data).__name__}"
+            )
+
+        # Non-2xx: capture body for the eventual error message.
+        try:
+            last_body = resp.text[:200]
+        except Exception:  # noqa: BLE001 - response body fetch is best-effort
+            last_body = ""
+
+        # Decide whether this status is worth retrying. 429 (rate limit) and
+        # 5xx (server) are transient; 4xx-other is usually fatal (auth, etc.).
+        retryable = status == 429 or 500 <= status < 600
+        if not retryable or attempt > FETCH_TASKS_MAX_RETRIES:
+            break
+
+        # Honor Retry-After if the server provides a small one; otherwise
+        # use a short cap so we don't sit idle.
+        retry_after_raw = ""
+        try:
+            retry_after_raw = resp.headers.get("retry-after", "") or ""
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            retry_after = int(retry_after_raw) if retry_after_raw else FETCH_TASKS_RETRY_BASE_SEC
+        except (TypeError, ValueError):
+            retry_after = FETCH_TASKS_RETRY_BASE_SEC
+        wait = min(max(retry_after, 1), FETCH_TASKS_RETRY_MAX_SEC)
+
+        if log is not None:
+            log(
+                f"[fetch-tasks] status={status} (attempt {attempt}/"
+                f"{FETCH_TASKS_MAX_RETRIES}); sleeping {wait}s then retrying."
+            )
+        time.sleep(wait)
+
+    raise RuntimeError(
+        f"GET /api/tasks failed after {FETCH_TASKS_MAX_RETRIES + 1} attempt(s): "
+        f"status={last_status} body={last_body!r}"
+    )
 
 
 def complete_task(
@@ -310,7 +366,9 @@ def process_account(acc: dict, log, dry_run: bool) -> dict:
 
     log(f"[{name}] fetching tasks list...")
     try:
-        tasks = fetch_tasks(bearer, cookie)
+        tasks = fetch_tasks(
+            bearer, cookie, log=lambda msg: log(f"[{name}] {msg}")
+        )
     except Exception as e:  # noqa: BLE001
         log(f"[{name}] [error] failed to fetch tasks: {e}")
         empty_result["error"] = 1
