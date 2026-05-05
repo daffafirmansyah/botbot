@@ -649,6 +649,37 @@ def _process_topup_sequential(
             _sleep_with_stop(INTER_ACCOUNT_SPACING_SEC)
 
 
+def _log_skip_reasons(accounts: list[dict], state: dict, now: float, log) -> None:
+    """
+    Emit one log line per account that _eligible_accounts would drop, with
+    the concrete reason (daily cooldown hours remaining, or per-account
+    rate-limit window). Balance/dust skips are logged separately by
+    _resolve_overrides so we don't duplicate them here.
+
+    Called only at fire time so the main heartbeat loop doesn't spam the
+    log every 10s with identical skip lines.
+    """
+    for acc in accounts:
+        name = acc.get("name", "?")
+        entry = get_account_state(state, name)
+        cd_remaining = _seconds_until_cooldown_ends(entry["last_success_at"], now)
+        if cd_remaining > 0:
+            log(
+                f"[{name}] [skip] in 24h cooldown, "
+                f"{cd_remaining/3600.0:.1f}h remaining "
+                f"(last success {entry['last_success_at']})."
+            )
+            continue
+        spacing_remaining = PER_ACCOUNT_SPACING_SEC - (
+            now - float(entry["last_attempt_ts"])
+        )
+        if spacing_remaining > 0:
+            log(
+                f"[{name}] [skip] per-account rate-limit window, "
+                f"{spacing_remaining:.1f}s remaining."
+            )
+
+
 def _process_topup(
     accounts: list[dict],
     state: dict,
@@ -659,11 +690,14 @@ def _process_topup(
 ) -> None:
     """Dispatch eligible accounts on a single top-up event."""
     now = time.time()
+    _log_skip_reasons(accounts, state, now, log)
     eligible = _eligible_accounts(accounts, state, now)
     delta = current_hot - prev_hot
+    skipped = len(accounts) - len(eligible)
     log(
         f"[topup] hot wallet {prev_hot/1e9:.9f} -> {current_hot/1e9:.9f} SOL "
-        f"(+{delta/1e9:.9f}); {len(eligible)} of {len(accounts)} account(s) eligible."
+        f"(+{delta/1e9:.9f}); {len(eligible)} of {len(accounts)} account(s) "
+        f"eligible (skipped={skipped} via cooldown/rate-limit)."
     )
     if not eligible:
         return
