@@ -56,7 +56,14 @@ from core import (
 # Tunables
 # ---------------------------------------------------------------------------
 
-POLL_INTERVAL_SEC = 10                   # how often we check the hot wallet balance
+# Lowered from 10s to 3s after observing the admin hot-wallet drains in
+# ~3 minutes under bot competition. At 10s we were losing up to a full
+# polling window (avg 5s) before even starting to fire; at 3s worst-case
+# detection lag is ~3s (avg 1.5s), which can be the difference between
+# 64/64 and 30/64 accounts landing before drain. Solana public RPC
+# handles getBalance comfortably at this rate; if you switch to premium
+# RPC you can safely go lower (e.g. 1s).
+POLL_INTERVAL_SEC = 3                    # how often we check the hot wallet balance
 TOPUP_THRESHOLD_LAMPORTS = 100_000_000   # 0.1 SOL — only fire on real admin refills
 # Per-account spacing between attempts from the SAME account across different
 # topup events. Aligned with withdraw.py's INTER_ACCOUNT_SPACING_SEC (5s);
@@ -577,13 +584,28 @@ def _process_topup_parallel(
         log(f"[parallel] no accounts to fire (cache hits={hits} misses={misses} dust-skip={dust}).")
         return
 
+    # Priority order: fire biggest-balance accounts FIRST so they claim
+    # before the hot wallet drains under competition. Unknown-balance
+    # entries (override is None -> live fetch) go last because they also
+    # pay a 0-17s rate-limit retry tax on the first /api/user call.
+    def _priority_key(item: tuple[dict, Optional[float]]) -> float:
+        _acc, override = item
+        return -(override if override is not None else -1.0)
+
+    plan.sort(key=_priority_key)
+
     stagger = max(PARALLEL_STAGGER_MS, 0) / 1000.0
     total_dispatch = stagger * (len(plan) - 1)
+    top_previews = [
+        f"{acc['name']}({ov:.4f})" for acc, ov in plan[:5]
+        if ov is not None
+    ]
     log(
         f"[parallel] firing {len(plan)} account(s) "
         f"(cache hits={hits} misses={misses} dust-skip={dust}; "
         f"max workers={MAX_PARALLEL_WORKERS}, "
-        f"stagger={PARALLEL_STAGGER_MS}ms => dispatch window {total_dispatch:.1f}s)."
+        f"stagger={PARALLEL_STAGGER_MS}ms => dispatch window {total_dispatch:.1f}s; "
+        f"priority top5: {top_previews})."
     )
     state_lock = threading.Lock()
     workers = min(MAX_PARALLEL_WORKERS, len(plan))
