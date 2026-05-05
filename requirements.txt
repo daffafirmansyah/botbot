@@ -1,1 +1,4 @@
 requests>=2.31,<3
+# TLS impersonation for the claimyshare endpoints (CloudFlare WAF dodge).
+# Optional: core.py falls back to plain requests if this import fails.
+curl_cffi>=0.7,<1

@@ -9,15 +9,39 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import random
 import sys
 import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 import requests
+
+# ---------------------------------------------------------------------------
+# TLS impersonation
+# ---------------------------------------------------------------------------
+# CloudFlare WAF fingerprints the TLS handshake of `requests` (OpenSSL +
+# Python's default cipher order) and frequently slow-modes it. curl_cffi
+# replays a real Chrome TLS handshake byte-for-byte, so the WAF treats us
+# like a normal browser. We use it ONLY for claimyshare API calls; Solana
+# public RPCs are unaffected and stay on plain `requests`.
+#
+# If curl_cffi is missing we transparently fall back to `requests` so the
+# bot still works (just without the impersonation benefit).
+try:
+    from curl_cffi import requests as _cffi_requests  # type: ignore
+    _TLS_IMPERSONATION_AVAILABLE = True
+except ImportError:  # pragma: no cover - exercised only when dep missing
+    _cffi_requests = None  # type: ignore[assignment]
+    _TLS_IMPERSONATION_AVAILABLE = False
+
+# Browser profile to impersonate. Newer profile = more recent fingerprint.
+# Keep this in sync with what curl_cffi advertises as a stable target.
+# Override by setting CLAIMY_IMPERSONATE in the environment if needed.
+IMPERSONATE_PROFILE = os.environ.get("CLAIMY_IMPERSONATE", "chrome120")
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -508,6 +532,58 @@ def is_cooldown_message(parsed: dict | None) -> bool:
     return "too many withdrawal" in msg
 
 
+# Headers that curl_cffi sets automatically as part of the impersonate
+# profile. We strip them from caller-provided headers so the TLS handshake
+# fingerprint and the HTTP-level identity stay in sync (a Chrome-120 TLS
+# handshake paired with a Chrome-147 user-agent is a WAF red flag).
+_HEADERS_OWNED_BY_IMPERSONATE = (
+    "user-agent",
+    "sec-ch-ua",
+    "sec-ch-ua-mobile",
+    "sec-ch-ua-platform",
+    "accept-encoding",
+)
+
+
+def _strip_owned_headers(headers: dict) -> dict:
+    """Return a copy of `headers` with curl_cffi-managed keys removed."""
+    out = {}
+    for k, v in headers.items():
+        if k.lower() in _HEADERS_OWNED_BY_IMPERSONATE:
+            continue
+        out[k] = v
+    return out
+
+
+def _claimyshare_get(url: str, *, headers: dict, timeout: int) -> Any:
+    """GET against claimyshare with TLS impersonation when available.
+
+    Returns a response object that quacks like requests.Response (has
+    `.status_code`, `.headers`, `.json()`, `.text`).
+    """
+    if _TLS_IMPERSONATION_AVAILABLE and _cffi_requests is not None:
+        return _cffi_requests.get(
+            url,
+            headers=_strip_owned_headers(headers),
+            timeout=timeout,
+            impersonate=IMPERSONATE_PROFILE,
+        )
+    return requests.get(url, headers=headers, timeout=timeout)
+
+
+def _claimyshare_post(url: str, *, headers: dict, json: dict, timeout: int) -> Any:
+    """POST against claimyshare with TLS impersonation when available."""
+    if _TLS_IMPERSONATION_AVAILABLE and _cffi_requests is not None:
+        return _cffi_requests.post(
+            url,
+            headers=_strip_owned_headers(headers),
+            json=json,
+            timeout=timeout,
+            impersonate=IMPERSONATE_PROFILE,
+        )
+    return requests.post(url, headers=headers, json=json, timeout=timeout)
+
+
 def fetch_claimable_balance(cfg: dict, log: Logger) -> float | None:
     """
     GET /api/user with this account's credentials and return the
@@ -522,8 +598,8 @@ def fetch_claimable_balance(cfg: dict, log: Logger) -> float | None:
     headers["referer"] = "https://claimyshare.io/"
 
     try:
-        resp = requests.get(USER_API_URL, headers=headers, timeout=15)
-    except requests.RequestException as e:
+        resp = _claimyshare_get(USER_API_URL, headers=headers, timeout=15)
+    except Exception as e:  # noqa: BLE001 - both requests & curl_cffi raise here
         log(f"[{name}] [balance] network error: {e}")
         return None
 
@@ -620,8 +696,10 @@ def attempt_withdraw(
         attempt_num += 1
 
         try:
-            resp = requests.post(API_URL, headers=headers, json=body, timeout=30)
-        except requests.RequestException as e:
+            resp = _claimyshare_post(
+                API_URL, headers=headers, json=body, timeout=30
+            )
+        except Exception as e:  # noqa: BLE001 - requests/curl_cffi siblings
             log(f"[{name}] [error] network error during POST: {e}")
             return EXIT_NETWORK, None, 0
 
