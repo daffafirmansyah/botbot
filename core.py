@@ -60,10 +60,19 @@ USER_API_URL = "https://claimyshare.io/api/user"
 # tier, or return 401/403 — do NOT re-add them without testing.
 #
 # To add a private endpoint with an API key (recommended if you run the bot
-# 24/7), just append its URL to the list, e.g.:
+# 24/7), set HELIUS_API_KEY in the environment OR append its URL to the list:
 #     "https://mainnet.helius-rpc.com/?api-key=YOUR_KEY",
 #     "https://solana-mainnet.g.alchemy.com/v2/YOUR_KEY",
-SOLANA_RPCS = [
+#
+# When HELIUS_API_KEY is set, the Helius endpoint is prepended so it's the
+# primary (lower latency, higher rate limit). Public endpoints stay as
+# fallback so a Helius outage doesn't kill the bot.
+_HELIUS_KEY = os.environ.get("HELIUS_API_KEY", "").strip()
+SOLANA_RPCS = (
+    [f"https://mainnet.helius-rpc.com/?api-key={_HELIUS_KEY}"]
+    if _HELIUS_KEY
+    else []
+) + [
     "https://api.mainnet-beta.solana.com",   # Solana Labs official (primary)
     "https://solana-rpc.publicnode.com",     # PublicNode (anycast) fallback
 ]

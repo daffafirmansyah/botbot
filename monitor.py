@@ -56,14 +56,16 @@ from core import (
 # Tunables
 # ---------------------------------------------------------------------------
 
-# Lowered from 10s to 3s after observing the admin hot-wallet drains in
-# ~3 minutes under bot competition. At 10s we were losing up to a full
-# polling window (avg 5s) before even starting to fire; at 3s worst-case
-# detection lag is ~3s (avg 1.5s), which can be the difference between
-# 64/64 and 30/64 accounts landing before drain. Solana public RPC
-# handles getBalance comfortably at this rate; if you switch to premium
-# RPC you can safely go lower (e.g. 1s).
-POLL_INTERVAL_SEC = 3                    # how often we check the hot wallet balance
+# Lowered from 10s -> 3s -> 1s after observing the admin hot-wallet drains
+# in ~3 minutes under bot competition. With Helius (HELIUS_API_KEY set in
+# env, prepended in core.SOLANA_RPCS) the free tier comfortably handles
+# 60 reqs/min (1s polling = 86k req/day, well under the 100k/day cap).
+# Detection lag drops to ~0.5s avg vs 1.5s on 3s polling vs 5s on 10s.
+# That extra 1s of head-start is the entire difference between catching
+# a competitor-drained refill vs ABORTING with "hot wallet already drained".
+# Without a Helius key, public RPC may rate-limit at 1s; revert to 3s if
+# you see "rate-limited" or "503" entries from the Solana RPC layer.
+POLL_INTERVAL_SEC = 1                    # how often we check the hot wallet balance
 TOPUP_THRESHOLD_LAMPORTS = 100_000_000   # 0.1 SOL — only fire on real admin refills
 # Per-account spacing between attempts from the SAME account across different
 # topup events. Aligned with withdraw.py's INTER_ACCOUNT_SPACING_SEC (5s);
