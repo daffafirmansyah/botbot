@@ -258,15 +258,16 @@ def _balance_refresher_loop(
                 return
             name = acc.get("name", "?")
             try:
-                # Silent on success, escalate on errors only.
+                # Silent on success, escalate on errors only. single_attempt
+                # = no retry: a 429 here will be seen again on next sweep,
+                # there's no urgency. Without this flag a rate-limit storm
+                # would amplify (each fail consumed 4 API calls × 17s).
                 msgs: list[str] = []
                 balance = fetch_claimable_balance(
-                    acc, lambda m: msgs.append(m)
+                    acc, lambda m: msgs.append(m), single_attempt=True
                 )
                 cache.update(name, balance)
                 if balance is None:
-                    # First failure for an account is worth knowing about;
-                    # downgrade to one-line summary to avoid log spam.
                     last = msgs[-1] if msgs else "unknown error"
                     log(f"[balance-cache] {name}: refresh failed ({last[:120]})")
             except Exception as e:  # noqa: BLE001

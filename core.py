@@ -596,24 +596,38 @@ BALANCE_FETCH_RETRY_WAITS_SEC = (2, 5, 10)
 BALANCE_FETCH_MAX_RETRIES = len(BALANCE_FETCH_RETRY_WAITS_SEC)
 
 
-def fetch_claimable_balance(cfg: dict, log: Logger) -> float | None:
+def fetch_claimable_balance(
+    cfg: dict, log: Logger, single_attempt: bool = False
+) -> float | None:
     """
     GET /api/user with this account's credentials and return the
     `balanceSolTask` field as a float (SOL).
 
-    Retries 429 / 5xx with a short progressive backoff so a single
-    rate-limit hiccup doesn't spuriously skip a top-up. Returns None only
-    after exhausting retries or on a permanent failure (network, non-2xx,
-    non-JSON, missing field). Callers should treat None as "cannot
-    proceed".
+    Modes:
+      * Default (single_attempt=False): retries 429 / 5xx with the
+        BALANCE_FETCH_RETRY_WAITS_SEC schedule (~17s budget). Used by the
+        sniping hot path where a single fetch failure means a missed
+        top-up; the cost of looking inattentive to the WAF is worth
+        getting the value before the hot wallet drains.
+      * single_attempt=True: ONE shot, no retry. Used by the background
+        balance refresher in monitor.py. The refresher will retry the
+        account on its next sweep anyway, so spending 17s per account
+        when the IP is rate-limited just makes the storm worse. Failing
+        fast (1 API call instead of 4) lets the refresher walk through
+        all accounts quickly and gives the IP a chance to cool down.
+
+    Returns None on any failure or after the retry budget is exhausted.
+    Callers should treat None as "cannot proceed".
     """
     name = cfg.get("name", "?")
     headers = build_headers(cfg["bearer_token"], cfg["cookie"])
     # Balance fetch is a read from the app root, not the /withdraw page.
     headers["referer"] = "https://claimyshare.io/"
 
+    max_retries = 0 if single_attempt else BALANCE_FETCH_MAX_RETRIES
+
     last_status = 0
-    for attempt in range(1, BALANCE_FETCH_MAX_RETRIES + 2):  # initial + retries
+    for attempt in range(1, max_retries + 2):  # initial + retries
         try:
             resp = claimyshare_get(USER_API_URL, headers=headers, timeout=15)
         except Exception as e:  # noqa: BLE001 - both requests & curl_cffi raise
@@ -625,20 +639,20 @@ def fetch_claimable_balance(cfg: dict, log: Logger) -> float | None:
             break
 
         retryable = resp.status_code == 429 or 500 <= resp.status_code < 600
-        if not retryable or attempt > BALANCE_FETCH_MAX_RETRIES:
+        if not retryable or attempt > max_retries:
             log(f"[{name}] [balance] unexpected status {resp.status_code}.")
             return None
 
         wait = BALANCE_FETCH_RETRY_WAITS_SEC[attempt - 1]
         log(
             f"[{name}] [balance] status={resp.status_code} "
-            f"(attempt {attempt}/{BALANCE_FETCH_MAX_RETRIES}); sleeping "
+            f"(attempt {attempt}/{max_retries}); sleeping "
             f"{wait}s then retrying."
         )
         time.sleep(wait)
     else:
         # Loop fell through without `break` -> last attempt was non-200.
-        log(f"[{name}] [balance] gave up after {BALANCE_FETCH_MAX_RETRIES + 1} "
+        log(f"[{name}] [balance] gave up after {max_retries + 1} "
             f"attempt(s); last status={last_status}.")
         return None
 
