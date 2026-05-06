@@ -129,15 +129,20 @@ HEARTBEAT_INTERVAL_SEC = 300  # 5 minutes
 # top-up refills claimyshare's hot wallet, not the user's claimable amount),
 # so a top-up never invalidates a cached value.
 BALANCE_PRECACHE_ENABLED = True
-BALANCE_REFRESH_SPACING_SEC = 3.0    # delay between accounts inside one pass
-BALANCE_REFRESH_GAP_SEC = 90         # extra rest after a full pass through all accounts
+# Tightened settings (May 2026): user wants near-real-time balance update so
+# bot can detect balance increases (e.g. claimable rewards from completed
+# tasks) within ~1.5 min instead of ~5 min. With proxy pool active, the
+# extra /api/user load is distributed across rotating IPs and per-IP rate
+# limit is no longer the bottleneck.
+BALANCE_REFRESH_SPACING_SEC = 1.0    # delay between accounts inside one pass
+BALANCE_REFRESH_GAP_SEC = 30         # extra rest after a full pass through all accounts
 BALANCE_CACHE_MAX_AGE_SEC = 1800.0   # use cached value if fetched within last 30 min
 # Only refresh an account if its cached value is older than this threshold.
-# This skips accounts that are still "fresh enough", dramatically reducing
-# /api/user calls. With MAX_AGE=1800 and THRESHOLD=300, we refresh only the
-# accounts whose cache is older than 5 min, instead of all 64 every sweep.
-# Effect: ~6x fewer /api/user requests when cache is warm.
-BALANCE_REFRESH_AGE_THRESHOLD_SEC = 300.0
+# Lowered from 300s -> 60s so each sweep refreshes nearly all accounts,
+# giving us a ~1.5 min worst-case staleness on balance increases. This is
+# 5x more frequent than before but proxy distributes the load (each IP
+# only sees ~1 req per minute on average).
+BALANCE_REFRESH_AGE_THRESHOLD_SEC = 60.0
 # How long after startup we wait before declaring the cache "ready". Until
 # this point a top-up is allowed to fall back to live-fetch on cache miss.
 BALANCE_CACHE_WARMUP_SEC = 90.0
@@ -357,6 +362,13 @@ def _balance_refresher_loop(
                 continue
 
             try:
+                # Peek at previous cached value (any age within MAX_AGE) so
+                # we can detect a balance increase after the new fetch. None
+                # means we have no comparable prior value.
+                previous_balance = cache.get(
+                    name, max_age_sec=BALANCE_CACHE_MAX_AGE_SEC
+                )
+
                 # single_attempt = no retry. A 429 here will be seen again
                 # on next sweep, no urgency. Without this flag a rate-limit
                 # storm would amplify (each fail = 4 API calls × 17s).
@@ -374,6 +386,20 @@ def _balance_refresher_loop(
                     last = msgs[-1] if msgs else "unknown error"
                     log(f"[balance-cache] {name}: refresh failed ({last[:120]})")
                 else:
+                    # Detect balance increase (new claimable rewards, e.g.
+                    # task completion). Use a small epsilon to ignore
+                    # floating-point noise. Only log meaningful increases
+                    # (>= 1e-6 SOL = 0.000001) to avoid noise from rounding.
+                    if (
+                        previous_balance is not None
+                        and balance > previous_balance + 1e-6
+                    ):
+                        delta = balance - previous_balance
+                        log(
+                            f"[balance-cache] [INCREASE] {name} "
+                            f"+{delta:.6f} SOL "
+                            f"(was {previous_balance:.6f}, now {balance:.6f})"
+                        )
                     cache.update(name, balance)
                     consecutive_fails = 0
                     success_count += 1
