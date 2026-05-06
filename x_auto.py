@@ -347,7 +347,7 @@ def try_auto_claim(
     time.sleep(delay)
 
     for attempt in range(1, AUTO_CLAIM_MAX_RETRIES + 2):  # +1 initial + retries
-        status, body = complete_task(bearer, cookie, task_id)
+        status, body = complete_task(bearer, cookie, task_id, account_name=name)
         outcome = _classify_response(status, body)
 
         if outcome == "ok":

@@ -65,7 +65,10 @@ def probe_tasks(acc: dict) -> list[dict]:
     log = _make_logger("tasks")
     try:
         all_tasks = tasks.fetch_tasks(
-            acc["bearer_token"], acc["cookie"], log=log
+            acc["bearer_token"],
+            acc["cookie"],
+            log=log,
+            account_name=acc.get("name"),
         )
     except Exception as e:  # noqa: BLE001
         print(f"  STATUS: FAIL  {e}")
@@ -123,7 +126,10 @@ def probe_complete(acc: dict, all_tasks: list[dict]) -> None:
     print(f"  probing taskId={tid} '{title}' (type={vtype})...")
 
     status, body = tasks.complete_task(
-        acc["bearer_token"], acc["cookie"], int(tid)
+        acc["bearer_token"],
+        acc["cookie"],
+        int(tid),
+        account_name=acc.get("name"),
     )
     outcome = tasks._classify_response(status, body)
     print(f"  STATUS: {status}")

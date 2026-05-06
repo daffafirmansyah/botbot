@@ -51,6 +51,7 @@ from core import (
     build_headers,
     claimyshare_get,
     claimyshare_post,
+    get_proxy_for_account,
     load_accounts,
     make_logger,
 )
@@ -262,17 +263,27 @@ def _fmt_reward(parsed: dict | None) -> str:
 
 
 def fetch_tasks(
-    bearer: str, cookie: str, log: Callable[[str], None] | None = None
+    bearer: str,
+    cookie: str,
+    log: Callable[[str], None] | None = None,
+    account_name: str | None = None,
 ) -> list[dict]:
     """GET /api/tasks for one account, retrying on 429 / 5xx.
 
     Routed through `core.claimyshare_get` so the request shares the same
     Chrome-120 TLS fingerprint as monitor.py / withdraw.py.
 
+    When `account_name` is provided, the request is sent through that
+    account's assigned proxy (same one balance/withdraw uses). This keeps
+    the per-IP rate-limit at CloudFlare from spiking when many accounts
+    pull /api/tasks in sequence. Pass None for direct-VPS-IP behavior
+    (legacy callers without account context).
+
     Raises RuntimeError if every retry is exhausted with a non-2xx status,
     or ValueError if the response is shaped unexpectedly. Network errors
     bubble up from `claimyshare_get` as plain Exceptions.
     """
+    proxy = get_proxy_for_account(account_name) if account_name else None
     last_status = 0
     last_body = ""
     last_attempt = 0
@@ -282,6 +293,7 @@ def fetch_tasks(
             TASKS_LIST_URL,
             headers=_tasks_headers(bearer, cookie),
             timeout=HTTP_TIMEOUT_SEC,
+            proxy=proxy,
         )
         status = resp.status_code
         last_status = status
@@ -342,13 +354,22 @@ def fetch_tasks(
 
 
 def complete_task(
-    bearer: str, cookie: str, task_id: int
+    bearer: str,
+    cookie: str,
+    task_id: int,
+    account_name: str | None = None,
 ) -> tuple[int, dict | None]:
     """POST /api/tasks/complete with {taskId}. Returns (status, parsed_body).
 
     Uses `core.claimyshare_post` for TLS-impersonated traffic, falling back
     to plain `requests` if curl_cffi is unavailable.
+
+    When `account_name` is provided, routed through that account's assigned
+    proxy so /api/tasks/complete shares the same exit IP as the rest of
+    that account's claimyshare traffic (balance fetch, withdraw, etc.).
+    Without it, the request goes out the local VPS IP (legacy behavior).
     """
+    proxy = get_proxy_for_account(account_name) if account_name else None
     body = {"taskId": task_id}
     try:
         resp = claimyshare_post(
@@ -356,6 +377,7 @@ def complete_task(
             headers=_tasks_headers(bearer, cookie),
             json=body,
             timeout=HTTP_TIMEOUT_SEC,
+            proxy=proxy,
         )
     except Exception as e:  # noqa: BLE001 - requests/curl_cffi siblings
         return 0, {"error": f"network: {e}"}
@@ -400,7 +422,10 @@ def process_account(acc: dict, log, dry_run: bool) -> dict:
     log(f"[{name}] fetching tasks list...")
     try:
         tasks = fetch_tasks(
-            bearer, cookie, log=lambda msg: log(f"[{name}] {msg}")
+            bearer,
+            cookie,
+            log=lambda msg: log(f"[{name}] {msg}"),
+            account_name=name,
         )
     except Exception as e:  # noqa: BLE001
         log(f"[{name}] [error] failed to fetch tasks: {e}")
@@ -439,7 +464,7 @@ def process_account(acc: dict, log, dry_run: bool) -> dict:
             continue
 
         log(f"[{name}] posting taskId={tid} ('{title}')...")
-        status, body = complete_task(bearer, cookie, tid)
+        status, body = complete_task(bearer, cookie, tid, account_name=name)
         outcome = _classify_response(status, body)
 
         if outcome == "ok":
