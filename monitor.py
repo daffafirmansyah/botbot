@@ -254,6 +254,39 @@ class BalanceCache:
         except Exception:  # noqa: BLE001 - best-effort, never block the bot
             pass
 
+    def load_from_disk(
+        self, path: Path = None, max_age_sec: float = BALANCE_CACHE_MAX_AGE_SEC
+    ) -> int:
+        """Pre-populate cache from a disk snapshot written by a previous run.
+
+        Used on startup to avoid the cold-start /api/user burst: when the bot
+        restarts (especially after a 429-storm-triggered manual restart), the
+        IP is still hot from CloudFlare's perspective, so hitting /api/user
+        for all 64 accounts immediately just re-triggers the storm.
+
+        Loading the previous snapshot lets the TTL-based refresh skip every
+        account whose entry is still fresh, spreading the warmup over many
+        sweeps instead of bursting on sweep 1. Only entries with a real
+        balance (not None) and timestamp younger than max_age_sec are loaded.
+
+        Returns the number of entries loaded.
+        """
+        snap_path = path if path is not None else BALANCE_CACHE_SNAPSHOT_PATH
+        snap = load_balance_cache_snapshot(snap_path, max_age_sec=max_age_sec)
+        if snap is None:
+            return 0
+        now = time.time()
+        loaded = 0
+        with self._lock:
+            for name, (balance, ts) in snap.items():
+                if not isinstance(balance, (int, float)):
+                    continue
+                if (now - ts) > max_age_sec:
+                    continue
+                self._cache[name] = (balance, ts)
+                loaded += 1
+        return loaded
+
 
 def load_balance_cache_snapshot(
     path: Path = BALANCE_CACHE_SNAPSHOT_PATH,
@@ -966,6 +999,21 @@ def main() -> int:
     cache: Optional[BalanceCache] = None
     if BALANCE_PRECACHE_ENABLED:
         cache = BalanceCache()
+        # Pre-populate from previous run's disk snapshot. Avoids the cold-start
+        # /api/user burst: with a warm cache the TTL-based refresher skips
+        # most accounts on sweep 1, spreading the load instead of hammering
+        # the IP just as the WAF score is still high from the previous storm.
+        loaded = cache.load_from_disk()
+        if loaded > 0:
+            log(
+                f"[balance-cache] loaded {loaded} entries from disk snapshot "
+                f"(cold-start burst avoided)."
+            )
+        else:
+            log(
+                "[balance-cache] no usable disk snapshot; cold start with "
+                "empty cache (first sweep will hit /api/user for all accounts)."
+            )
         _start_balance_refresher(accounts, cache, log)
         log(
             f"[balance-cache] refresher started (spacing={BALANCE_REFRESH_SPACING_SEC}s, "
