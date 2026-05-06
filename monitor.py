@@ -129,9 +129,15 @@ HEARTBEAT_INTERVAL_SEC = 300  # 5 minutes
 # top-up refills claimyshare's hot wallet, not the user's claimable amount),
 # so a top-up never invalidates a cached value.
 BALANCE_PRECACHE_ENABLED = True
-BALANCE_REFRESH_SPACING_SEC = 1.5    # delay between accounts inside one pass
-BALANCE_REFRESH_GAP_SEC = 30         # extra rest after a full pass through all accounts
-BALANCE_CACHE_MAX_AGE_SEC = 600.0    # use cached value if fetched within last 10 min
+BALANCE_REFRESH_SPACING_SEC = 3.0    # delay between accounts inside one pass
+BALANCE_REFRESH_GAP_SEC = 90         # extra rest after a full pass through all accounts
+BALANCE_CACHE_MAX_AGE_SEC = 1800.0   # use cached value if fetched within last 30 min
+# Only refresh an account if its cached value is older than this threshold.
+# This skips accounts that are still "fresh enough", dramatically reducing
+# /api/user calls. With MAX_AGE=1800 and THRESHOLD=300, we refresh only the
+# accounts whose cache is older than 5 min, instead of all 64 every sweep.
+# Effect: ~6x fewer /api/user requests when cache is warm.
+BALANCE_REFRESH_AGE_THRESHOLD_SEC = 300.0
 # How long after startup we wait before declaring the cache "ready". Until
 # this point a top-up is allowed to fall back to live-fetch on cache miss.
 BALANCE_CACHE_WARMUP_SEC = 90.0
@@ -142,6 +148,11 @@ BALANCE_CACHE_WARMUP_SEC = 90.0
 # so the IP can actually cool down.
 BALANCE_REFRESH_FAIL_PAUSE_THRESHOLD = 10
 BALANCE_REFRESH_PAUSE_SEC = 300       # 5 minutes of zero traffic on /api/user
+# Sweep-level fail pause: if a single sweep has this many failures total
+# (not necessarily consecutive), assume IP is in a sustained rate-limit
+# state and pause. Catches the case where a 429 storm is interspersed
+# with occasional successes (which would reset the consecutive counter).
+BALANCE_REFRESH_SWEEP_FAIL_THRESHOLD = 15
 # Persisted cache snapshot. Other tools (account_status.py) read this file
 # instead of hitting /api/user themselves, so a status check while the bot
 # is running doesn't double-burst the IP rate limit. Written after every
@@ -278,20 +289,40 @@ def _balance_refresher_loop(
 ) -> None:
     """Background loop: rotate through accounts, refreshing each balance.
 
-    Per-account spacing keeps us under the per-IP rate window so the
-    refresh itself doesn't trigger 429s. After a full pass we sleep
-    BALANCE_REFRESH_GAP_SEC extra so total cycle time stays generous.
+    Smart refresh: skip accounts whose cache is still fresh (younger than
+    BALANCE_REFRESH_AGE_THRESHOLD_SEC). Drastically reduces /api/user load
+    once cache is warm. Per-account spacing keeps us under the per-IP rate
+    window. After a full pass we sleep BALANCE_REFRESH_GAP_SEC extra.
+
+    On refresh failure we PRESERVE the previous cached value (don't
+    overwrite with None) so a transient 429 doesn't degrade the cache.
+    Two pause triggers:
+      - consecutive: 10 in-a-row fails (hard storm)
+      - sweep-level: 15+ fails per sweep (sustained storm interspersed
+        with occasional successes)
     """
     consecutive_fails = 0
     while not _stop:
         success_count = 0
         fail_count = 0
+        skip_count = 0
         paused = False
 
         for acc in accounts:
             if _stop:
                 return
             name = acc.get("name", "?")
+
+            # Skip if cache is still fresh enough (TTL-based refresh).
+            # cache.get returns None if missing OR older than the threshold,
+            # so a non-None result means "we already have a recent value".
+            if (
+                cache.get(name, max_age_sec=BALANCE_REFRESH_AGE_THRESHOLD_SEC)
+                is not None
+            ):
+                skip_count += 1
+                continue
+
             try:
                 # single_attempt = no retry. A 429 here will be seen again
                 # on next sweep, no urgency. Without this flag a rate-limit
@@ -300,13 +331,17 @@ def _balance_refresher_loop(
                 balance = fetch_claimable_balance(
                     acc, lambda m: msgs.append(m), single_attempt=True
                 )
-                cache.update(name, balance)
                 if balance is None:
+                    # Preserve last good cached value: do NOT overwrite with None.
+                    # If never cached, leave absent so cache.get returns None as
+                    # before. The max_age_sec check still catches truly stale
+                    # entries.
                     consecutive_fails += 1
                     fail_count += 1
                     last = msgs[-1] if msgs else "unknown error"
                     log(f"[balance-cache] {name}: refresh failed ({last[:120]})")
                 else:
+                    cache.update(name, balance)
                     consecutive_fails = 0
                     success_count += 1
             except Exception as e:  # noqa: BLE001
@@ -350,11 +385,27 @@ def _balance_refresher_loop(
         stats = cache.stats()
         log(
             f"[balance-cache] sweep done | ok={success_count} "
-            f"fail={fail_count} | size={stats['size']} "
+            f"fail={fail_count} skip={skip_count} | size={stats['size']} "
             f"freshest={stats['freshest_age']:.0f}s "
             f"oldest={stats['oldest_age']:.0f}s | "
             f"sleeping {BALANCE_REFRESH_GAP_SEC}s before next pass."
         )
+
+        # Sweep-level fail pause: catches storms interspersed with successes.
+        # Distinct from consecutive_fails which only triggers on a hard run.
+        if fail_count >= BALANCE_REFRESH_SWEEP_FAIL_THRESHOLD:
+            log(
+                f"[balance-cache] sweep had {fail_count} failures "
+                f"(threshold {BALANCE_REFRESH_SWEEP_FAIL_THRESHOLD}) -> "
+                f"pausing {BALANCE_REFRESH_PAUSE_SEC}s to let IP cool down."
+            )
+            for _ in range(BALANCE_REFRESH_PAUSE_SEC):
+                if _stop:
+                    return
+                time.sleep(1)
+            consecutive_fails = 0
+            continue  # skip the regular gap, pause already covered it
+
         for _ in range(BALANCE_REFRESH_GAP_SEC):
             if _stop:
                 return
@@ -919,7 +970,9 @@ def main() -> int:
         log(
             f"[balance-cache] refresher started (spacing={BALANCE_REFRESH_SPACING_SEC}s, "
             f"gap={BALANCE_REFRESH_GAP_SEC}s, max_age={BALANCE_CACHE_MAX_AGE_SEC:.0f}s, "
-            f"warmup={BALANCE_CACHE_WARMUP_SEC:.0f}s)."
+            f"refresh_threshold={BALANCE_REFRESH_AGE_THRESHOLD_SEC:.0f}s, "
+            f"warmup={BALANCE_CACHE_WARMUP_SEC:.0f}s, "
+            f"sweep_fail_pause={BALANCE_REFRESH_SWEEP_FAIL_THRESHOLD})."
         )
 
     last_balance = int(state.get("last_hot_balance_lamports", 0))
