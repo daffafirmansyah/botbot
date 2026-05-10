@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import signal
 import sys
 import threading
@@ -98,9 +99,24 @@ MAX_PARALLEL_WORKERS = 64            # cap concurrent in-flight POSTs (auto-tigh
 # maximum sniping speed but high 429-storm risk — relies on aggressive retry
 # in core.py to recover the misses). Raise to 200/500/2000 if you start
 # seeing IP-level blocks (403 / connection refused, NOT just 429).
-# 2ms = still effectively a burst (64 accounts dispatched over ~126ms) but
-# avoids the exact-same-timestamp fingerprint that some WAFs flag.
-PARALLEL_STAGGER_MS = 2
+#
+# Phase 1 anti-WAF (May 2026): raised from 2ms to 50ms so a 64-account
+# top-up dispatches over ~3.15s instead of ~126ms. The hot wallet
+# typically lasts ~30s after a refill (4-5 SOL vs ~0.6 SOL total demand
+# from 64 accounts), so a 3-5s fire window is safely inside the race
+# buffer while looking far more organic to CloudFlare's burst-pattern
+# heuristics — 64 simultaneous bursts from 64 IPs is a recognizable
+# signature; a 3s gradual stream from 64 IPs is not.
+PARALLEL_STAGGER_MS = 50
+
+# Additional per-thread random jitter on top of the deterministic stagger.
+# Each fire's actual delay is (i * PARALLEL_STAGGER_MS) + uniform(JITTER_MIN,
+# JITTER_MAX) milliseconds. Breaks the perfectly-spaced dispatch pattern so
+# thread #N doesn't fire at exactly N*50ms. Total spread for 64 accounts:
+# ~3.15s baseline + up to 100ms jitter = ~3.25s end-to-end, still well
+# inside the hot-wallet race buffer.
+PARALLEL_JITTER_MS_MIN = 0
+PARALLEL_JITTER_MS_MAX = 100
 
 # Sequential fallback (only used if PARALLEL_FIRE = False):
 INTER_ACCOUNT_SPACING_SEC = 5
@@ -739,7 +755,9 @@ def _process_topup_parallel(
     plan.sort(key=_priority_key)
 
     stagger = max(PARALLEL_STAGGER_MS, 0) / 1000.0
-    total_dispatch = stagger * (len(plan) - 1)
+    jitter_min_s = max(PARALLEL_JITTER_MS_MIN, 0) / 1000.0
+    jitter_max_s = max(PARALLEL_JITTER_MS_MAX, jitter_min_s * 1000.0) / 1000.0
+    total_dispatch = stagger * (len(plan) - 1) + jitter_max_s
     # Always show first 5 of the plan so daffa14 (PRIORITY_ACCOUNTS[0])
     # is visible even if its balance is unknown/zero. Mark priority
     # accounts with a "*" prefix for at-a-glance verification.
@@ -752,7 +770,8 @@ def _process_topup_parallel(
         f"[parallel] firing {len(plan)} account(s) "
         f"(cache hits={hits} misses={misses} dust-skip={dust}; "
         f"workers={len(plan)} [coverage-first: 1 thread per account, no queueing], "
-        f"stagger={PARALLEL_STAGGER_MS}ms => dispatch window {total_dispatch:.1f}s; "
+        f"stagger={PARALLEL_STAGGER_MS}ms + jitter {PARALLEL_JITTER_MS_MIN}-"
+        f"{PARALLEL_JITTER_MS_MAX}ms => dispatch window ~{total_dispatch:.1f}s; "
         f"priority top5: {top_previews})."
     )
     state_lock = threading.Lock()
@@ -773,10 +792,15 @@ def _process_topup_parallel(
     workers = len(plan)
 
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="wd") as ex:
+        # Per-thread delay = deterministic stagger + random jitter. The
+        # jitter breaks the perfectly-spaced fire pattern (which itself
+        # could be a fingerprint) so 64 dispatches look like organic
+        # traffic instead of a cron-aligned bot wave.
         futures = [
             ex.submit(
                 _fire_one_threaded, acc, state, state_lock, log,
-                i * stagger, override,
+                (i * stagger) + random.uniform(jitter_min_s, jitter_max_s),
+                override,
             )
             for i, (acc, override) in enumerate(plan)
         ]

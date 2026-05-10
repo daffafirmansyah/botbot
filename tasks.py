@@ -294,6 +294,7 @@ def fetch_tasks(
             headers=_tasks_headers(bearer, cookie),
             timeout=HTTP_TIMEOUT_SEC,
             proxy=proxy,
+            account_name=account_name,
         )
         status = resp.status_code
         last_status = status
@@ -378,6 +379,7 @@ def complete_task(
             json=body,
             timeout=HTTP_TIMEOUT_SEC,
             proxy=proxy,
+            account_name=account_name,
         )
     except Exception as e:  # noqa: BLE001 - requests/curl_cffi siblings
         return 0, {"error": f"network: {e}"}

@@ -41,7 +41,28 @@ except ImportError:  # pragma: no cover - exercised only when dep missing
 # Browser profile to impersonate. Newer profile = more recent fingerprint.
 # Keep this in sync with what curl_cffi advertises as a stable target.
 # Override by setting CLAIMY_IMPERSONATE in the environment if needed.
+#
+# Phase 1 anti-WAF (May 2026): instead of a single profile for all 64
+# accounts (which makes every burst look like 64 clones at the JA3/JA4
+# layer even when each clone exits a different IP), we keep a small pool
+# of recent Chrome variants and assign each account a stable profile via
+# get_impersonate_profile_for_account(). The default IMPERSONATE_PROFILE
+# below is still honored as the fallback for callers without an account
+# context (and as the env-override knob for one-off testing).
 IMPERSONATE_PROFILE = os.environ.get("CLAIMY_IMPERSONATE", "chrome120")
+
+# Pool of modern Chrome impersonate profiles. All four are real Chrome
+# stable releases curl_cffi knows how to imitate; mixing them means 64
+# accounts spread their fingerprints across 4 distinct TLS handshakes
+# while still all looking like "Chrome on Windows" at the application
+# layer (consistent with the cookies/headers claimyshare originally
+# saw when the user logged in via a real browser).
+IMPERSONATE_PROFILES = (
+    "chrome120",
+    "chrome124",
+    "chrome131",
+    "chrome136",
+)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -631,6 +652,29 @@ def get_proxy_for_account(account_name: str) -> Optional[str]:
     return pool[idx % len(pool)]
 
 
+def get_impersonate_profile_for_account(account_name: Optional[str]) -> str:
+    """Stable per-account curl_cffi impersonate profile.
+
+    Same hashing strategy as get_proxy_for_account so a given account
+    always gets the same (proxy, profile) pair. Across the full account
+    list this spreads TLS+UA fingerprints evenly across
+    IMPERSONATE_PROFILES so a 64-fire top-up stops looking like 64
+    identical clones to JA3/JA4-based WAF detection.
+
+    Returns IMPERSONATE_PROFILE (the env-override default) when no
+    account name is provided -- preserves legacy behavior for callers
+    that don't have account context.
+    """
+    if not account_name:
+        return IMPERSONATE_PROFILE
+    order = _load_account_order()
+    idx = order.get(account_name)
+    if idx is None:
+        import zlib
+        idx = zlib.crc32(account_name.encode("utf-8"))
+    return IMPERSONATE_PROFILES[idx % len(IMPERSONATE_PROFILES)]
+
+
 def _proxies_dict(proxy_url: Optional[str]) -> Optional[dict]:
     """Convert a single proxy URL into the {http, https} dict curl_cffi /
     requests both accept, or None if no proxy.
@@ -694,7 +738,12 @@ def _strip_owned_headers(headers: dict) -> dict:
 
 
 def claimyshare_get(
-    url: str, *, headers: dict, timeout: int, proxy: Optional[str] = None
+    url: str,
+    *,
+    headers: dict,
+    timeout: int,
+    proxy: Optional[str] = None,
+    account_name: Optional[str] = None,
 ) -> Any:
     """GET against claimyshare with TLS impersonation + optional per-account
     proxy.
@@ -703,13 +752,19 @@ def claimyshare_get(
     `.status_code`, `.headers`, `.json()`, `.text`). Use this for ANY
     claimyshare.io endpoint so the WAF dodge stays consistent across
     monitor.py / withdraw.py / tasks.py.
+
+    When `account_name` is provided, the request uses that account's
+    rotating impersonate profile (via get_impersonate_profile_for_account)
+    so 64 concurrent fires distribute their JA3/JA4 fingerprints across
+    IMPERSONATE_PROFILES rather than all looking identical.
     """
     proxies = _proxies_dict(proxy)
+    profile = get_impersonate_profile_for_account(account_name)
     if _TLS_IMPERSONATION_AVAILABLE and _cffi_requests is not None:
         kwargs = dict(
             headers=_strip_owned_headers(headers),
             timeout=timeout,
-            impersonate=IMPERSONATE_PROFILE,
+            impersonate=profile,
         )
         if proxies:
             kwargs["proxies"] = proxies
@@ -727,16 +782,22 @@ def claimyshare_post(
     json: dict,
     timeout: int,
     proxy: Optional[str] = None,
+    account_name: Optional[str] = None,
 ) -> Any:
     """POST against claimyshare with TLS impersonation + optional per-account
-    proxy."""
+    proxy.
+
+    `account_name` selects the impersonate profile the same way
+    claimyshare_get does -- see that docstring for the rationale.
+    """
     proxies = _proxies_dict(proxy)
+    profile = get_impersonate_profile_for_account(account_name)
     if _TLS_IMPERSONATION_AVAILABLE and _cffi_requests is not None:
         kwargs = dict(
             headers=_strip_owned_headers(headers),
             json=json,
             timeout=timeout,
-            impersonate=IMPERSONATE_PROFILE,
+            impersonate=profile,
         )
         if proxies:
             kwargs["proxies"] = proxies
@@ -795,7 +856,11 @@ def fetch_claimable_balance(
     for attempt in range(1, max_retries + 2):  # initial + retries
         try:
             resp = claimyshare_get(
-                USER_API_URL, headers=headers, timeout=15, proxy=proxy
+                USER_API_URL,
+                headers=headers,
+                timeout=15,
+                proxy=proxy,
+                account_name=name,
             )
         except Exception as e:  # noqa: BLE001 - both requests & curl_cffi raise
             log(f"[{name}] [balance] network error: {e}")
@@ -804,6 +869,18 @@ def fetch_claimable_balance(
         last_status = resp.status_code
         if resp.status_code == 200:
             break
+
+        # Distinct branch for 401 so token/cookie expiry is visible in the
+        # log -- otherwise it gets buried in the generic 'unexpected status'
+        # bucket and the only sign of trouble is the account silently
+        # refusing to refresh forever.
+        if resp.status_code == 401:
+            log(
+                f"[{name}] [auth] 401 Unauthorized on /api/user -- "
+                f"bearer token or cookie likely expired; re-extract from "
+                f"browser session."
+            )
+            return None
 
         retryable = resp.status_code == 429 or 500 <= resp.status_code < 600
         if not retryable or attempt > max_retries:
@@ -921,7 +998,9 @@ def attempt_withdraw(
     headers = build_headers(cfg["bearer_token"], cfg["cookie"])
     body = {"amountSol": amount, "walletAddress": wallet}
     # Same proxy as this account's balance fetch so session state /
-    # rate-limit counters stay on a single IP per account.
+    # rate-limit counters stay on a single IP per account. Same impersonate
+    # profile follows automatically because claimyshare_post derives it
+    # from the same `account_name`.
     proxy = get_proxy_for_account(name)
 
     # ----- Retry loop -----
@@ -937,7 +1016,12 @@ def attempt_withdraw(
 
         try:
             resp = claimyshare_post(
-                API_URL, headers=headers, json=body, timeout=30, proxy=proxy
+                API_URL,
+                headers=headers,
+                json=body,
+                timeout=30,
+                proxy=proxy,
+                account_name=name,
             )
         except Exception as e:  # noqa: BLE001 - requests/curl_cffi siblings
             log(f"[{name}] [error] network error during POST: {e}")
@@ -953,6 +1037,18 @@ def attempt_withdraw(
             f"[{name}] response status={status} "
             f"body={parsed if parsed is not None else resp.text!r}"
         )
+
+        # ----- 401: token / cookie expired, NOT retryable -----
+        # No amount of waiting will fix expired credentials; we surface the
+        # problem clearly so the user can re-extract from a browser session
+        # instead of letting the account quietly burn its retry budget.
+        if status == 401:
+            log(
+                f"[{name}] [auth] 401 Unauthorized on /api/withdraw -- "
+                f"bearer token or cookie likely expired; re-extract from "
+                f"browser session."
+            )
+            return EXIT_API_ERROR, parsed, status
 
         # ----- 429: per-JWT rate-limit, retry after Retry-After -----
         if status == 429:
